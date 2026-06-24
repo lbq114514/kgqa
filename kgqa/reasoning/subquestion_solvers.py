@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from kgqa.utils.logging import get_logger
 from kgqa.utils.text import normalize_text, path_to_text
-from kgqa.utils.types import ReasoningPath, SubQuestionSpec, Triple
+from kgqa.utils.types import ReasoningPath, SubQuestionSpec, Triple, TripleFact
 
 LOGGER = get_logger(__name__)
 
@@ -32,6 +32,26 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(normalized)
     return deduped
+
+
+def _make_triple_fact(
+    *,
+    head_id: str,
+    head_label: str,
+    relation_id: str,
+    tail_id: str,
+    tail_label: str,
+    tail_kind: str = "id",
+) -> TripleFact:
+    """Build one stable fact object for solver-produced paths."""
+    return TripleFact(
+        head_id=str(head_id or "").strip(),
+        head_label=str(head_label or "").strip(),
+        relation_id=str(relation_id or "").strip(),
+        tail_id=str(tail_id or "").strip() if str(tail_kind or "id").strip().lower() == "id" else "",
+        tail_label=str(tail_label or "").strip(),
+        tail_kind=str(tail_kind or "id").strip().lower(),
+    )
 
 
 def _question_implies_operation(question: str) -> str:
@@ -64,6 +84,7 @@ class SubquestionExecutionContext:
     sub_question: SubQuestionSpec
     graph_api: Any
     step_seed_ids: list[str]
+    constraint_target_ids: list[str]
     relation_ids: list[str]
     resolved_sub_answers: dict[str, dict[str, Any]]
     execute_explore: Callable[[], list[ReasoningPath]]
@@ -114,16 +135,6 @@ class ConstrainedCollectSolver(BaseSubquestionSolver):
 
     @staticmethod
     def _constraint_terms(context: SubquestionExecutionContext) -> list[str]:
-        dependency_terms: list[str] = []
-        for dependency_id in context.sub_question.depends_on:
-            payload = context.resolved_sub_answers.get(dependency_id, {})
-            dependency_terms.extend(
-                [
-                    *[str(value).strip() for value in payload.get("predicted_answers", []) if str(value).strip()],
-                    *[str(value).strip() for value in payload.get("literals", []) if str(value).strip()],
-                    str(payload.get("answer") or "").strip(),
-                ]
-            )
         return _unique_preserve_order(
             [
                 *[node.name for node in context.sub_question.interested_nodes if node.name],
@@ -136,7 +147,6 @@ class ConstrainedCollectSolver(BaseSubquestionSolver):
                 ],
                 *[entity.name for entity in context.sub_question.local_topic_entities if entity.name],
                 *context.sub_question.downstream_filters,
-                *dependency_terms,
             ]
         )
 
@@ -165,6 +175,12 @@ class ConstrainedCollectSolver(BaseSubquestionSolver):
             constraint_terms=constraint_terms,
             limit=max(8, min(40, len(context.step_seed_ids) * 6)),
         )
+        if context.constraint_target_ids:
+            target_id_set = {value for value in context.constraint_target_ids if value}
+            constrained_rows = [
+                row for row in constrained_rows
+                if str(row.get("target_entity_id") or "").strip() in target_id_set
+            ]
         if not constrained_rows:
             return SubquestionSolverResult(
                 solver_type="explore",
@@ -190,9 +206,19 @@ class ConstrainedCollectSolver(BaseSubquestionSolver):
                 nodes=[source_label, target_label],
                 text=path_to_text([source_label, target_label], [triple]),
                 source_stage="constrained_collect",
+                triple_facts=[
+                    _make_triple_fact(
+                        head_id=source_id,
+                        head_label=source_label,
+                        relation_id=relation_id,
+                        tail_id=target_id,
+                        tail_label=target_label,
+                    )
+                ],
                 pruning_status="preserved",
                 matched_relations=[relation_id],
                 path_score=float(row.get("score", 0.0)),
+                edge_ids=[f"{source_id}:{relation_id}:{target_id}"],
                 terminal_node_id=target_id,
                 terminal_node_kind="id",
                 matched_answer_type_hints=[context.sub_question.expected_answer_type] if context.sub_question.expected_answer_type else [],
@@ -227,6 +253,7 @@ class ConstrainedCollectSolver(BaseSubquestionSolver):
             solver_debug={
                 "mode": "relation_locked_constrained_collect",
                 "constraint_terms": constraint_terms[:8],
+                "constraint_target_ids": list(context.constraint_target_ids[:8]),
                 "selected_relation_ids": list(context.relation_ids),
                 "row_count": len(constrained_rows),
             },
@@ -241,15 +268,14 @@ class VerifySolver(BaseSubquestionSolver):
     solver_type = "verify"
 
     def _collect_target_entity_ids(self, context: SubquestionExecutionContext) -> list[str]:
+        if context.constraint_target_ids:
+            return _unique_preserve_order(list(context.constraint_target_ids))
         graph_api = context.graph_api
         targets: list[str] = []
         if graph_api is not None and hasattr(graph_api, "resolve_entity_mentions"):
             target_mentions = [node.name for node in context.sub_question.interested_nodes if node.name]
             if target_mentions:
                 targets.extend(graph_api.resolve_entity_mentions(target_mentions, top_k=1))
-        for dependency_id in context.sub_question.depends_on:
-            dependency = context.resolved_sub_answers.get(dependency_id, {})
-            targets.extend([str(item) for item in dependency.get("entity_ids", []) if str(item).strip()])
         return _unique_preserve_order(targets)
 
     def _select_relation_ids(self, context: SubquestionExecutionContext) -> list[str]:
@@ -302,8 +328,18 @@ class VerifySolver(BaseSubquestionSolver):
                             nodes=nodes,
                             text=path_to_text(nodes, [triple]),
                             source_stage="verify_solver",
+                            triple_facts=[
+                                _make_triple_fact(
+                                    head_id=seed_id if not reverse_output else candidate_id,
+                                    head_label=source_label if not reverse_output else target_label,
+                                    relation_id=relation_id,
+                                    tail_id=candidate_id if not reverse_output else seed_id,
+                                    tail_label=target_label if not reverse_output else source_label,
+                                )
+                            ],
                             pruning_status="preserved",
                             matched_relations=[relation_id],
+                            edge_ids=[f"{seed_id}:{relation_id}:{candidate_id}"],
                             terminal_node_id=candidate_id,
                             terminal_node_kind="id",
                             search_strategy="verify_solver",
@@ -368,8 +404,18 @@ class VerifySolver(BaseSubquestionSolver):
                             nodes=nodes,
                             text=path_to_text(nodes, [triple]),
                             source_stage="verify_solver",
+                            triple_facts=[
+                                _make_triple_fact(
+                                    head_id=source_id,
+                                    head_label=source_label,
+                                    relation_id=relation_id,
+                                    tail_id=target_id,
+                                    tail_label=target_label,
+                                )
+                            ],
                             pruning_status="preserved",
                             matched_relations=[relation_id],
+                            edge_ids=[f"{source_id}:{relation_id}:{target_id}"],
                             terminal_node_id=target_id,
                             terminal_node_kind="id",
                             search_strategy="verify_solver",
@@ -394,8 +440,18 @@ class VerifySolver(BaseSubquestionSolver):
                             nodes=nodes,
                             text=path_to_text(nodes, [triple]),
                             source_stage="verify_solver",
+                            triple_facts=[
+                                _make_triple_fact(
+                                    head_id=target_id,
+                                    head_label=target_label,
+                                    relation_id=relation_id,
+                                    tail_id=source_id,
+                                    tail_label=source_label,
+                                )
+                            ],
                             pruning_status="preserved",
                             matched_relations=[relation_id],
+                            edge_ids=[f"{target_id}:{relation_id}:{source_id}"],
                             terminal_node_id=target_id,
                             terminal_node_kind="id",
                             search_strategy="verify_solver",
@@ -448,8 +504,18 @@ class VerifySolver(BaseSubquestionSolver):
                         nodes=nodes,
                         text=path_to_text(nodes, [triple]),
                         source_stage="verify_solver",
+                        triple_facts=[
+                            _make_triple_fact(
+                                head_id=edge.neighbor_id if edge.reversed else source_id,
+                                head_label=target_label if edge.reversed else source_label,
+                                relation_id=edge.triple.relation,
+                                tail_id=source_id if edge.reversed else edge.neighbor_id,
+                                tail_label=source_label if edge.reversed else target_label,
+                            )
+                        ],
                         pruning_status="preserved",
                         matched_relations=[edge.triple.relation],
+                        edge_ids=[f"{source_id}:{edge.triple.relation}:{edge.neighbor_id}"],
                         terminal_node_id=edge.neighbor_id,
                         terminal_node_kind="id",
                         search_strategy="verify_solver",
@@ -502,8 +568,25 @@ class VerifySolver(BaseSubquestionSolver):
                         nodes=nodes,
                         text=path_to_text(nodes, [first_triple, second_triple]),
                         source_stage="verify_solver",
+                        triple_facts=[
+                            _make_triple_fact(
+                                head_id=source_id,
+                                head_label=source_label,
+                                relation_id=first_relation_id,
+                                tail_id=mid_id,
+                                tail_label=mid_label,
+                            ),
+                            _make_triple_fact(
+                                head_id=mid_id,
+                                head_label=mid_label,
+                                relation_id=second_relation_id,
+                                tail_id=target_id,
+                                tail_label=target_label,
+                            ),
+                        ],
                         pruning_status="preserved",
                         matched_relations=[first_relation_id, second_relation_id],
+                        edge_ids=[f"{source_id}:{first_relation_id}:{mid_id}", f"{mid_id}:{second_relation_id}:{target_id}"],
                         terminal_node_id=target_id,
                         terminal_node_kind="id",
                         search_strategy="verify_solver",
@@ -556,8 +639,25 @@ class VerifySolver(BaseSubquestionSolver):
                             nodes=nodes,
                             text=path_to_text(nodes, [first_triple, second_triple]),
                             source_stage="verify_solver",
+                            triple_facts=[
+                                _make_triple_fact(
+                                    head_id=source_id,
+                                    head_label=source_label,
+                                    relation_id=first_edge.triple.relation,
+                                    tail_id=first_edge.neighbor_id,
+                                    tail_label=mid_label,
+                                ),
+                                _make_triple_fact(
+                                    head_id=first_edge.neighbor_id,
+                                    head_label=mid_label,
+                                    relation_id=second_edge.triple.relation,
+                                    tail_id=second_edge.neighbor_id,
+                                    tail_label=target_label,
+                                ),
+                            ],
                             pruning_status="preserved",
                             matched_relations=[first_edge.triple.relation, second_edge.triple.relation],
+                            edge_ids=[f"{source_id}:{first_edge.triple.relation}:{first_edge.neighbor_id}", f"{first_edge.neighbor_id}:{second_edge.triple.relation}:{second_edge.neighbor_id}"],
                             terminal_node_id=second_edge.neighbor_id,
                             terminal_node_kind="id",
                             search_strategy="verify_solver",
@@ -592,6 +692,45 @@ class VerifySolver(BaseSubquestionSolver):
             )
         relation_ids = self._select_relation_ids(context)
         if not relation_ids:
+            candidate_paths, verification_rows = self._exact_direct_verify(context, target_entity_ids, [])
+            if verification_rows:
+                selected_relation_ids = _unique_preserve_order(
+                    [
+                        relation_id
+                        for row in verification_rows
+                        for relation_id in row.get("relation_path", [])
+                        if str(relation_id).strip()
+                    ]
+                )
+                LOGGER.info(
+                    "Verify solver execution sub_question_id=%s checked_pair_count=%d matched_pair_count=%d verification_mode=%s selected_relation_ids=%s fallback_used=false",
+                    context.sub_question.id,
+                    len(context.step_seed_ids) * len(target_entity_ids),
+                    len(verification_rows),
+                    "direct_verify_unrestricted",
+                    selected_relation_ids[:5],
+                )
+                return SubquestionSolverResult(
+                    solver_type=self.solver_type,
+                    candidate_paths=candidate_paths,
+                    structured_outputs={
+                        "verification_rows": verification_rows,
+                        "entity_set_role": "candidate_answers",
+                        "set_operation_hint": "none",
+                        "solver_execution_mode": "direct_verify_unrestricted",
+                    },
+                    solver_debug={
+                        "verification_mode": "direct_verify_unrestricted",
+                        "checked_pair_count": len(context.step_seed_ids) * len(target_entity_ids),
+                        "matched_pair_count": len(verification_rows),
+                        "selected_relation_ids": selected_relation_ids,
+                        "relation_ids_inferred": True,
+                    },
+                    primary_entity_ids=_unique_preserve_order(
+                        [row["target_entity_id"] for row in verification_rows if row.get("matched")]
+                    ),
+                    allow_local_relation_probe=False,
+                )
             fallback = context.execute_explore()
             LOGGER.info(
                 "Verify solver execution sub_question_id=%s checked_pair_count=%d matched_pair_count=0 verification_mode=fallback selected_relation_ids=[] fallback_used=true",

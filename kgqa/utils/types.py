@@ -15,6 +15,18 @@ class Triple:
     tail: str
 
 
+@dataclass(frozen=True)
+class TripleFact:
+    """One id-preserving evidence triple used for program-side grounding."""
+
+    head_id: str = ""
+    head_label: str = ""
+    relation_id: str = ""
+    tail_id: str = ""
+    tail_label: str = ""
+    tail_kind: str = "id"
+
+
 @dataclass
 class QuestionAnalysisResult:
     """Structured question analysis produced by the LLM."""
@@ -129,6 +141,7 @@ class ResolvedSubQuestion:
     interested_node_candidates: list[ResolvedCandidate] = field(default_factory=list)
     relation_candidates: list[ResolvedCandidate] = field(default_factory=list)
     seed_node_ids: list[str] = field(default_factory=list)
+    constraint_target_ids: list[str] = field(default_factory=list)
     relation_ids: list[str] = field(default_factory=list)
     selected_relation_ids: list[str] = field(default_factory=list)
     propagated_answer_node_ids: list[str] = field(default_factory=list)
@@ -156,6 +169,7 @@ class AgenticStepResult:
     sub_answer: str = ""
     sub_answer_entities: list[str] = field(default_factory=list)
     sub_answer_literals: list[str] = field(default_factory=list)
+    sub_answer_grounding: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     attempt_count: int = 0
     depends_on_step_ids: list[str] = field(default_factory=list)
@@ -180,6 +194,7 @@ class AgenticStepResult:
             "sub_answer": self.sub_answer,
             "sub_answer_entities": list(self.sub_answer_entities),
             "sub_answer_literals": list(self.sub_answer_literals),
+            "sub_answer_grounding": dict(self.sub_answer_grounding),
             "status": self.status,
             "attempt_count": int(self.attempt_count),
             "depends_on_step_ids": list(self.depends_on_step_ids),
@@ -267,6 +282,7 @@ class ReasoningPath:
     nodes: list[str]
     text: str
     source_stage: str
+    triple_facts: list[TripleFact] = field(default_factory=list)
     pruning_status: str = "unknown"
     matched_relations: list[str] = field(default_factory=list)
     path_score: float = 0.0
@@ -281,6 +297,7 @@ class ReasoningPath:
         """Convert to a JSON-serializable dictionary."""
         return {
             "triples": [asdict(triple) for triple in self.triples],
+            "triple_facts": [asdict(fact) for fact in self.triple_facts],
             "nodes": list(self.nodes),
             "text": self.text,
             "source_stage": self.source_stage,
@@ -297,6 +314,28 @@ class ReasoningPath:
 
 
 @dataclass
+class AnswerGrounding:
+    """Canonical answer representation shared by sub-question and final-answer stages."""
+
+    answer_texts: list[str] = field(default_factory=list)
+    entity_ids: list[str] = field(default_factory=list)
+    entity_labels: list[str] = field(default_factory=list)
+    literal_values: list[str] = field(default_factory=list)
+    primary_answer_text: str = ""
+    primary_entity_id: str = ""
+    answer_view_triples: list[dict[str, str]] = field(default_factory=list)
+    answer_view_facts: list[dict[str, str]] = field(default_factory=list)
+    supporting_relation_ids: list[str] = field(default_factory=list)
+    source_mode: str = ""
+    confidence: str = ""
+    debug: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to a JSON-serializable dictionary."""
+        return asdict(self)
+
+
+@dataclass
 class AnswerResult:
     """Answering stage output."""
 
@@ -307,6 +346,7 @@ class AnswerResult:
     resolved_literals: list[str] = field(default_factory=list)
     supporting_paths: list[Any] = field(default_factory=list)
     reason: str = ""
+    grounding: AnswerGrounding | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dictionary."""
@@ -349,6 +389,7 @@ class PipelineResult:
     sample_id: str | None = None
     gold_answers: list[str] = field(default_factory=list)
     predicted_answers: list[str] = field(default_factory=list)
+    final_grounding: dict[str, Any] = field(default_factory=dict)
     search_trace: list[SearchTraceStep] = field(default_factory=list)
     alignment_debug: list[dict[str, Any]] = field(default_factory=list)
 
@@ -368,6 +409,7 @@ class PipelineResult:
             "summarized_paths": self.summarized_paths,
             "gold_answers": self.gold_answers,
             "predicted_answers": self.predicted_answers,
+            "final_grounding": self.final_grounding,
             "answer": self.answer,
             "sufficient": self.sufficient,
             "confidence": self.confidence,

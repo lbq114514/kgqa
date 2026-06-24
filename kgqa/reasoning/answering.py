@@ -114,6 +114,37 @@ def _normalize_answer_result(parsed: dict[str, Any]) -> AnswerResult:
     )
 
 
+def _normalize_sufficiency_result(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Normalize sufficiency JSON and preserve optional answer hints."""
+    sufficient = bool(parsed.get("sufficient", False))
+    reason = str(parsed.get("reason") or "")
+    raw_candidates = parsed.get("answer_candidates", [])
+    answer_candidates = answers_from_llm_output(raw_candidates)
+    raw_primary = parsed.get("primary_answer", "")
+    if isinstance(raw_primary, list):
+        primary_answer = str(raw_primary[0]).strip() if raw_primary else ""
+    else:
+        primary_answer = str(raw_primary or "").strip()
+    if not answer_candidates and primary_answer:
+        answer_candidates = answers_from_llm_output(primary_answer)
+    answer_candidates = [
+        item for item in answer_candidates if not _is_failure_like_answer(item)
+    ]
+    if _is_failure_like_answer(primary_answer):
+        primary_answer = ""
+    if not primary_answer and answer_candidates:
+        primary_answer = str(answer_candidates[0]).strip()
+    if not sufficient:
+        primary_answer = ""
+        answer_candidates = []
+    return {
+        "sufficient": sufficient,
+        "reason": reason,
+        "primary_answer": primary_answer,
+        "answer_candidates": answer_candidates,
+    }
+
+
 def check_sufficiency(
     question: str,
     topic_entities: list[str],
@@ -146,11 +177,20 @@ def check_sufficiency(
         summarized_paths=json.dumps(compact_paths, ensure_ascii=False, indent=2),
     )
     raw = llm.generate(prompt, max_tokens=256)
-    parsed = robust_json_parse(raw, fallback={"sufficient": False, "reason": "LLM JSON parse failed."})
+    parsed = robust_json_parse(
+        raw,
+        fallback={"sufficient": False, "reason": "LLM JSON parse failed.", "primary_answer": "", "answer_candidates": []},
+    )
     if isinstance(parsed, dict) and "sufficient" in parsed:
-        LOGGER.info("Sufficiency result: %s", parsed)
-        return parsed
-    return {"sufficient": False, "reason": "LLM JSON parse failed."}
+        normalized = _normalize_sufficiency_result(parsed)
+        LOGGER.info("Sufficiency result: %s", normalized)
+        return normalized
+    return {
+        "sufficient": False,
+        "reason": "LLM JSON parse failed.",
+        "primary_answer": "",
+        "answer_candidates": [],
+    }
 
 
 def generate_answer(

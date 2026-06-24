@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from kgqa.kg.graph_api import BaseGraphAPI, ExternalGraphNeighbor
 from kgqa.retrieval.ranking import PathCandidateScorer, PathReranker, PathSelector, SearchScoringContext
 from kgqa.utils.text import deduplicate_paths
-from kgqa.utils.types import ReasoningPath, Triple
+from kgqa.utils.types import ReasoningPath, Triple, TripleFact
 
 
 @dataclass
@@ -65,6 +65,7 @@ def _path_from_edge(
     current_node_id: str,
     current_nodes: list[str],
     current_triples: list[Triple],
+    current_facts: list[TripleFact],
     current_edge_ids: list[str],
     current_strategy: str,
     edge: ExternalGraphNeighbor,
@@ -88,11 +89,30 @@ def _path_from_edge(
     next_triples = current_triples + [triple]
     terminal_node_id = edge.neighbor_id
     terminal_node_kind = "id" if terminal_node_id.startswith(("m.", "g.")) else "literal"
+    if edge.reversed:
+        fact = TripleFact(
+            head_id=edge.neighbor_id,
+            head_label=next_label,
+            relation_id=edge.triple.relation,
+            tail_id=current_node_id if current_node_id.startswith(("m.", "g.")) else "",
+            tail_label=current_label,
+            tail_kind="id",
+        )
+    else:
+        fact = TripleFact(
+            head_id=current_node_id if current_node_id.startswith(("m.", "g.")) else "",
+            head_label=current_label,
+            relation_id=edge.triple.relation,
+            tail_id=terminal_node_id if terminal_node_kind == "id" else "",
+            tail_label=next_label,
+            tail_kind=terminal_node_kind,
+        )
     return ReasoningPath(
         triples=next_triples,
         nodes=next_nodes,
         text=_path_text_for_backend(backend, next_nodes, next_triples),
         source_stage="retrieval_search",
+        triple_facts=[*current_facts, fact],
         edge_ids=current_edge_ids + [f"{current_node_id}:{edge.triple.relation}:{terminal_node_id}"],
         terminal_node_id=terminal_node_id,
         terminal_node_kind=terminal_node_kind,
@@ -130,7 +150,7 @@ class ConstrainedBFSSearcher:
 
     def search(self, request: SearchRequest) -> list[ReasoningPath]:
         """Enumerate bounded simple paths from the provided seed entities."""
-        queue: deque[tuple[str, list[str], list[str], list[Triple], list[str], int]] = deque()
+        queue: deque[tuple[str, list[str], list[str], list[Triple], list[TripleFact], list[str], int]] = deque()
         path_limit = _path_limit(request.max_paths)
         for seed_id in request.seed_entity_ids:
             queue.append(
@@ -140,13 +160,14 @@ class ConstrainedBFSSearcher:
                     [seed_id],
                     [],
                     [],
+                    [],
                     0,
                 )
             )
         results: list[ReasoningPath] = []
         expansions = 0
         while queue and (path_limit is None or len(results) < path_limit) and expansions < request.max_expansions:
-            current_id, node_labels, node_ids, triples, edge_ids, depth = queue.popleft()
+            current_id, node_labels, node_ids, triples, triple_facts, edge_ids, depth = queue.popleft()
             if depth >= request.max_depth:
                 continue
             for edge in self.backend.get_neighbors(
@@ -163,6 +184,7 @@ class ConstrainedBFSSearcher:
                     current_node_id=current_id,
                     current_nodes=node_labels,
                     current_triples=triples,
+                    current_facts=triple_facts,
                     current_edge_ids=edge_ids,
                     current_strategy="bfs",
                     edge=edge,
@@ -179,6 +201,7 @@ class ConstrainedBFSSearcher:
                         next_path.nodes,
                         node_ids + [edge.neighbor_id],
                         next_path.triples,
+                        next_path.triple_facts,
                         next_path.edge_ids,
                         depth + 1,
                     )
@@ -201,14 +224,14 @@ class BeamSearchSearcher:
             reward_literal_terminals=request.literal_policy != "stop",
         )
         path_limit = _path_limit(request.max_paths)
-        frontier: list[tuple[str, list[str], list[str], list[Triple], list[str]]] = []
+        frontier: list[tuple[str, list[str], list[str], list[Triple], list[TripleFact], list[str]]] = []
         for seed_id in request.seed_entity_ids:
-            frontier.append((seed_id, [self.backend.get_entity_display_name(seed_id)], [seed_id], [], []))
+            frontier.append((seed_id, [self.backend.get_entity_display_name(seed_id)], [seed_id], [], [], []))
         results: list[ReasoningPath] = []
         expansions = 0
         for _depth in range(request.max_depth):
-            candidate_states: list[tuple[float, tuple[str, list[str], list[str], list[Triple], list[str]]]] = []
-            for current_id, node_labels, node_ids, triples, edge_ids in frontier:
+            candidate_states: list[tuple[float, tuple[str, list[str], list[str], list[Triple], list[TripleFact], list[str]]]] = []
+            for current_id, node_labels, node_ids, triples, triple_facts, edge_ids in frontier:
                 neighbors = self.backend.get_neighbors(
                     node_id=current_id,
                     include_reverse=True,
@@ -224,6 +247,7 @@ class BeamSearchSearcher:
                         current_node_id=current_id,
                         current_nodes=node_labels,
                         current_triples=triples,
+                        current_facts=triple_facts,
                         current_edge_ids=edge_ids,
                         current_strategy="beam",
                         edge=edge,
@@ -241,6 +265,7 @@ class BeamSearchSearcher:
                                 next_path.nodes,
                                 node_ids + [edge.neighbor_id],
                                 next_path.triples,
+                                next_path.triple_facts,
                                 next_path.edge_ids,
                             ),
                         )

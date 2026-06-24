@@ -70,6 +70,7 @@ from kgqa.utils.types import (
     AgenticPlanStep,
     AgenticRunState,
     AgenticStepResult,
+    AnswerGrounding,
     AnswerResult,
     EntityMentionSpec,
     ExplorationHints,
@@ -441,6 +442,7 @@ class KGQAPipeline:
                 sample_id=sample_id,
                 gold_answers=gold_answers,
                 predicted_answers=answer_result.predicted_answers,
+                final_grounding=self._grounding_to_dict(answer_result.grounding),
                 search_trace=trace,
             )
 
@@ -525,6 +527,7 @@ class KGQAPipeline:
                 sample_id=sample_id,
                 gold_answers=gold_answers,
                 predicted_answers=answer_result.predicted_answers,
+                final_grounding=self._grounding_to_dict(answer_result.grounding),
                 search_trace=trace,
             )
 
@@ -607,6 +610,7 @@ class KGQAPipeline:
             sample_id=sample_id,
             gold_answers=gold_answers,
             predicted_answers=answer_result.predicted_answers,
+            final_grounding=self._grounding_to_dict(answer_result.grounding),
             search_trace=trace,
         )
 
@@ -813,7 +817,10 @@ class KGQAPipeline:
                         raw_dependency_seed_ids = self._dependency_seed_ids_for_sub_question(
                             sub_question=sub_question,
                             dependency_seed_ids={
-                                key: list(value.get("entity_ids", []))
+                                key: self._dependency_payload_seed_entity_ids(
+                                    payload=value,
+                                    graph_api=graph_api,
+                                )
                                 for key, value in run_state.resolved_sub_answers.items()
                             },
                         )
@@ -889,6 +896,11 @@ class KGQAPipeline:
                         plan_step=plan_step_context,
                         step_analysis=step_analysis,
                         step_seed_ids=step_seed_ids,
+                        constraint_target_ids=(
+                            list(resolved_sub_question.constraint_target_ids)
+                            if resolved_sub_question is not None
+                            else []
+                        ),
                         relation_ids=relation_ids,
                         sub_question=sub_question,
                         resolved_sub_answers=run_state.resolved_sub_answers,
@@ -916,6 +928,11 @@ class KGQAPipeline:
                         strict_probe_paths = self._probe_paths_with_local_relations(
                             sub_question=sub_question,
                             step_seed_ids=step_seed_ids,
+                            constraint_target_ids=(
+                                list(resolved_sub_question.constraint_target_ids)
+                                if resolved_sub_question is not None
+                                else []
+                            ),
                             relation_ids=local_relation_ids,
                             graph_api=graph_api,
                             trace=trace,
@@ -929,6 +946,30 @@ class KGQAPipeline:
                             depth=min(dmax, loop_index),
                         )
                     effective_relation_ids = self._deduplicate_strings(relation_ids + local_relation_ids)
+                    candidate_paths = self._normalize_terminal_cvt_paths(
+                        graph_api=graph_api,
+                        candidate_paths=candidate_paths,
+                        subquestion_text=sub_question.question,
+                        expected_answer_type=sub_question.expected_answer_type,
+                        relation_hint_names=effective_relation_ids,
+                        anchor_mentions=self._deduplicate_strings(
+                            [
+                                sub_question.question,
+                                *[entity.name for entity in self._effective_sub_question_topics(sub_question) if entity.name],
+                                *[node.name for node in sub_question.interested_nodes if node.name],
+                                *[relation.name for relation in sub_question.interested_relations if relation.name],
+                                *[
+                                    alias
+                                    for relation in sub_question.interested_relations
+                                    for alias in relation.aliases
+                                    if alias
+                                ],
+                            ]
+                        ),
+                        trace=trace,
+                        depth=min(dmax, loop_index),
+                        stage_note=f"sub_question_id={sub_question.id}",
+                    )
                     all_candidate_paths = deduplicate_paths(all_candidate_paths + candidate_paths)
 
                     pruned_paths = self._prune_paths_for_context(
@@ -998,13 +1039,17 @@ class KGQAPipeline:
                         llm=self.llm,
                         agentic_state=run_state,
                     )
+                    sub_answer_result = self._apply_sufficiency_answer_hints(
+                        sub_answer_result,
+                        sub_sufficiency,
+                    )
                     sub_answer_result = self._backfill_subquestion_answer(
                         sub_question=sub_question,
                         pruned_paths=pruned_paths,
                         step_summaries=step_summaries,
                         answer_result=sub_answer_result,
                     )
-                    output_entities, output_literals, type_filter_stats = self._canonicalize_subquestion_outputs(
+                    grounding, type_filter_stats = self._canonicalize_subquestion_outputs(
                         graph_api=graph_api,
                         sub_question=sub_question,
                         pruned_paths=pruned_paths,
@@ -1014,34 +1059,60 @@ class KGQAPipeline:
                         primary_entity_ids=solver_result.primary_entity_ids,
                         primary_literals=solver_result.primary_literals,
                     )
+                    self._project_grounding_to_answer_result(sub_answer_result, grounding)
+                    output_entities, output_literals, projected_answer = self._project_grounding_to_payload(
+                        grounding
+                    )
+                    projected_predicted_answers = self._grounding_candidate_answers(grounding)
+                    has_grounded_payload = self._grounding_has_answer_payload(grounding)
+                    if self._is_propagatable_text(projected_answer):
+                        sub_answer_result.answer = projected_answer
                     sub_answer_result.reason = str(sub_sufficiency.get("reason", ""))
-                    output_type_ok = self._subquestion_outputs_match_expected_type(
+                    type_eval = self._evaluate_subquestion_output_type(
                         graph_api=graph_api,
                         sub_question=sub_question,
                         entity_ids=output_entities,
                         literals=output_literals,
                         answer_result=sub_answer_result,
+                        step_summaries=step_summaries,
                     )
-                    soft_type_ok = False
-                    if not output_type_ok:
-                        soft_type_ok = self._subquestion_outputs_soft_match_expected_type(
-                            graph_api=graph_api,
-                            sub_question=sub_question,
-                            entity_ids=output_entities,
-                            literals=output_literals,
-                            answer_result=sub_answer_result,
-                            step_summaries=step_summaries,
-                        )
-                        if soft_type_ok:
-                            output_type_ok = True
+                    output_type_ok = bool(type_eval.get("passed", False))
+                    soft_type_ok = bool(type_eval.get("soft_pass", False))
+                    boolean_type_bypass = self._should_bypass_boolean_subquestion_type_check(
+                        sub_question=sub_question,
+                        answer_result=sub_answer_result,
+                        sufficiency=sub_sufficiency,
+                    )
+                    if boolean_type_bypass and not output_type_ok:
+                        output_type_ok = True
+                        soft_type_ok = True
+                        type_eval = {
+                            **dict(type_eval),
+                            "passed": True,
+                            "soft_pass": True,
+                            "mode": "boolean_sufficiency_bypass",
+                        }
+                    LOGGER.info(
+                        "Sub-question type check sub_question_id=%s expected_type=%s passed=%s mode=%s "
+                        "hard_match=%s relation_score=%.3f embedding_score=%.3f candidate_ids=%s labels=%s",
+                        sub_question.id,
+                        sub_question.expected_answer_type,
+                        output_type_ok,
+                        type_eval.get("mode", ""),
+                        bool(type_eval.get("hard_match", False)),
+                        float(type_eval.get("relation_score", 0.0)),
+                        float(type_eval.get("embedding_score", 0.0)),
+                        output_entities[:3],
+                        output_literals[:3],
+                    )
 
                     sub_resolved = output_type_ok and (
                         (
                             bool(sub_sufficiency.get("sufficient", False))
-                            and bool(sub_answer_result.predicted_answers)
+                            and has_grounded_payload
                         )
                         or (
-                            bool(sub_answer_result.predicted_answers)
+                            has_grounded_payload
                             and self._summaries_have_fact_evidence(step_summaries)
                         )
                     )
@@ -1056,9 +1127,13 @@ class KGQAPipeline:
                                 sub_answer_result.reason
                                 if output_type_ok and not soft_type_ok
                                 else (
-                                    f"{sub_answer_result.reason} Soft type pass-through accepted for expected_answer_type={sub_question.expected_answer_type}."
+                                    f"{sub_answer_result.reason} Soft type pass-through accepted for expected_answer_type={sub_question.expected_answer_type}. "
+                                    f"type_mode={type_eval.get('mode', '')} relation_score={float(type_eval.get('relation_score', 0.0)):.3f} "
+                                    f"embedding_score={float(type_eval.get('embedding_score', 0.0)):.3f}."
                                     if soft_type_ok
-                                    else f"{sub_answer_result.reason} Type check failed for expected_answer_type={sub_question.expected_answer_type}."
+                                    else f"{sub_answer_result.reason} Type check failed for expected_answer_type={sub_question.expected_answer_type}. "
+                                    f"type_mode={type_eval.get('mode', '')} relation_score={float(type_eval.get('relation_score', 0.0)):.3f} "
+                                    f"embedding_score={float(type_eval.get('embedding_score', 0.0)):.3f}."
                                 )
                             ),
                         )
@@ -1081,10 +1156,11 @@ class KGQAPipeline:
                         resolved_relation_ids=list(effective_relation_ids),
                         retrieved_paths=list(candidate_paths),
                         summarized_evidence=list(step_summaries),
-                        candidate_answers=list(sub_answer_result.predicted_answers),
+                        candidate_answers=list(projected_predicted_answers),
                         sub_answer=sub_answer_result.answer,
                         sub_answer_entities=list(output_entities),
                         sub_answer_literals=list(output_literals),
+                        sub_answer_grounding=self._grounding_to_dict(grounding),
                         status=step_status,
                         attempt_count=attempt_index,
                         depends_on_step_ids=list(sub_question.depends_on),
@@ -1093,24 +1169,31 @@ class KGQAPipeline:
                         carryover_text_values=list(output_literals),
                         is_step_resolved=sub_resolved,
                         solver_type=solver_result.solver_type,
-                        solver_debug={**dict(solver_result.solver_debug), **type_filter_stats},
+                        solver_debug={**dict(solver_result.solver_debug), **type_filter_stats, "type_check": dict(type_eval)},
                     )
                     run_state.step_history.append(step_result)
 
                     if sub_resolved:
+                        step_summaries = [
+                            {**item, "grounding": self._grounding_to_dict(grounding)}
+                            if isinstance(item, dict)
+                            else item
+                            for item in step_summaries
+                        ]
                         run_state.evidence_bank.extend(step_summaries)
                         run_state.resolved_sub_answers[sub_question.id] = {
                             "answer": sub_answer_result.answer,
-                            "predicted_answers": list(sub_answer_result.predicted_answers),
+                            "predicted_answers": list(projected_predicted_answers),
                             "entity_ids": list(output_entities),
                             "literals": list(output_literals),
+                            "grounding": self._grounding_to_dict(grounding),
                             "supporting_paths": list(sub_answer_result.supporting_paths),
                             "evidence_relations": self._collect_summary_relation_ids(step_summaries),
                             "evidence_text": self._collect_summary_evidence_text(step_summaries),
                             "depends_on": list(sub_question.depends_on),
                             "solver_type": solver_result.solver_type,
                             "solver_reason": sub_question.solver_reason,
-                            "solver_debug": dict(solver_result.solver_debug),
+                            "solver_debug": {**dict(solver_result.solver_debug), "type_check": dict(type_eval)},
                             "entity_set_role": str(
                                 solver_result.structured_outputs.get("entity_set_role") or "candidate_answers"
                             ),
@@ -1277,6 +1360,18 @@ class KGQAPipeline:
                     llm=self.llm,
                     agentic_state=run_state,
                 )
+                final_answer_result = self._apply_sufficiency_answer_hints(
+                    final_answer_result,
+                    sufficiency,
+                )
+                final_answer_result.grounding = self._build_final_grounding(
+                    graph_api=graph_api,
+                    question_analysis=analysis,
+                    summarized_paths=final_summaries,
+                    answer_result=final_answer_result,
+                    source_mode="llm_answer",
+                )
+                self._project_grounding_to_answer_result(final_answer_result, final_answer_result.grounding)
                 final_answer_result = self._filter_final_answer_result_by_type(
                     graph_api=graph_api,
                     question_analysis=analysis,
@@ -1289,6 +1384,7 @@ class KGQAPipeline:
                         candidate_paths=all_candidate_paths,
                         summarized_paths=final_summaries,
                         answer_result=final_answer_result,
+                        sufficiency=sufficiency,
                         agentic_state=run_state,
                         trace=trace,
                         depth=min(dmax, max(loop_index, 1)),
@@ -1344,6 +1440,7 @@ class KGQAPipeline:
                 sample_id=sample_id,
                 gold_answers=gold_answers,
                 predicted_answers=final_answer_result.predicted_answers,
+                final_grounding=self._grounding_to_dict(final_answer_result.grounding),
                 search_trace=trace,
                 alignment_debug=alignment_debug,
             )
@@ -1382,7 +1479,181 @@ class KGQAPipeline:
             resolved_entity_mentions=[],
             resolved_literals=[],
             supporting_paths=[],
+            grounding=self._empty_answer_grounding(),
         )
+
+    @staticmethod
+    def _empty_answer_grounding() -> AnswerGrounding:
+        """Return an empty canonical answer-grounding object."""
+        return AnswerGrounding()
+
+    def _grounding_to_dict(self, grounding: AnswerGrounding | None) -> dict[str, Any]:
+        """Serialize grounding to a stable dictionary for JSON outputs."""
+        if grounding is None:
+            return {}
+        return grounding.to_dict()
+
+    def _grounding_from_payload(self, payload: dict[str, Any] | None) -> AnswerGrounding:
+        """Read grounding from a resolved-sub-answer payload when available."""
+        if not isinstance(payload, dict):
+            return self._empty_answer_grounding()
+        raw = payload.get("grounding")
+        if not isinstance(raw, dict):
+            return self._empty_answer_grounding()
+        return AnswerGrounding(
+            answer_texts=[str(item).strip() for item in raw.get("answer_texts", []) if str(item).strip()],
+            entity_ids=[str(item).strip() for item in raw.get("entity_ids", []) if str(item).strip()],
+            entity_labels=[str(item).strip() for item in raw.get("entity_labels", []) if str(item).strip()],
+            literal_values=[str(item).strip() for item in raw.get("literal_values", []) if str(item).strip()],
+            primary_answer_text=str(raw.get("primary_answer_text") or "").strip(),
+            primary_entity_id=str(raw.get("primary_entity_id") or "").strip(),
+            answer_view_triples=[
+                {
+                    "head": str(item.get("head") or "").strip(),
+                    "relation": str(item.get("relation") or "").strip(),
+                    "tail": str(item.get("tail") or "").strip(),
+                }
+                for item in raw.get("answer_view_triples", [])
+                if isinstance(item, dict)
+            ],
+            answer_view_facts=[
+                {
+                    "head_id": str(item.get("head_id") or "").strip(),
+                    "head_label": str(item.get("head_label") or "").strip(),
+                    "relation_id": str(item.get("relation_id") or "").strip(),
+                    "tail_id": str(item.get("tail_id") or "").strip(),
+                    "tail_label": str(item.get("tail_label") or "").strip(),
+                    "tail_kind": str(item.get("tail_kind") or "id").strip(),
+                }
+                for item in raw.get("answer_view_facts", [])
+                if isinstance(item, dict)
+            ],
+            supporting_relation_ids=[
+                str(item).strip() for item in raw.get("supporting_relation_ids", []) if str(item).strip()
+            ],
+            source_mode=str(raw.get("source_mode") or "").strip(),
+            confidence=str(raw.get("confidence") or "").strip(),
+            debug=dict(raw.get("debug", {})) if isinstance(raw.get("debug", {}), dict) else {},
+        )
+
+    def _project_grounding_to_answer_result(
+        self,
+        answer_result: AnswerResult,
+        grounding: AnswerGrounding | None,
+    ) -> AnswerResult:
+        """Project canonical grounding back to legacy AnswerResult fields."""
+        grounding = grounding or self._empty_answer_grounding()
+        answer_result.grounding = grounding
+        answer_texts = self._deduplicate_strings(
+            [value for value in grounding.answer_texts if self._is_propagatable_text(value)]
+        )
+        literal_values = self._deduplicate_strings(
+            [value for value in grounding.literal_values if self._is_propagatable_text(value)]
+        )
+        entity_labels = self._deduplicate_strings(
+            [value for value in grounding.entity_labels if self._is_propagatable_text(value)]
+        )
+        answer_result.predicted_answers = list(answer_texts)
+        answer_result.resolved_entity_mentions = list(entity_labels or answer_texts)
+        answer_result.resolved_literals = self._deduplicate_strings(answer_texts + literal_values)
+        if self._is_propagatable_text(grounding.primary_answer_text):
+            answer_result.answer = grounding.primary_answer_text
+        elif answer_texts:
+            answer_result.answer = answer_texts[0]
+        elif literal_values:
+            answer_result.answer = literal_values[0]
+        elif not self._is_propagatable_text(answer_result.answer):
+            answer_result.answer = "insufficient"
+        return answer_result
+
+    def _project_grounding_to_payload(
+        self,
+        grounding: AnswerGrounding | None,
+    ) -> tuple[list[str], list[str], str]:
+        """Return legacy entity_ids/literals/answer view from grounding."""
+        grounding = grounding or self._empty_answer_grounding()
+        entity_ids = self._deduplicate_strings(grounding.entity_ids)
+        literals = self._deduplicate_strings(
+            [*grounding.answer_texts, *grounding.literal_values]
+        )[: self._agentic_max_carryover_text_values()]
+        answer = grounding.primary_answer_text or (literals[0] if literals else "")
+        return entity_ids, literals, answer
+
+    def _grounding_candidate_answers(
+        self,
+        grounding: AnswerGrounding | None,
+    ) -> list[str]:
+        """Return answer-facing candidate texts derived only from canonical grounding."""
+        grounding = grounding or self._empty_answer_grounding()
+        return self._deduplicate_strings(
+            [
+                *[
+                    value
+                    for value in grounding.answer_texts
+                    if self._is_propagatable_text(value)
+                ],
+                *[
+                    value
+                    for value in grounding.literal_values
+                    if self._is_propagatable_text(value)
+                ],
+                *[
+                    value
+                    for value in grounding.entity_labels
+                    if self._is_propagatable_text(value)
+                ],
+            ]
+        )
+
+    def _grounding_has_answer_payload(
+        self,
+        grounding: AnswerGrounding | None,
+    ) -> bool:
+        """Return whether canonical grounding contains any answer-carrying payload."""
+        grounding = grounding or self._empty_answer_grounding()
+        return bool(
+            grounding.entity_ids
+            or grounding.answer_texts
+            or grounding.literal_values
+            or grounding.entity_labels
+            or (grounding.primary_answer_text and self._is_propagatable_text(grounding.primary_answer_text))
+        )
+
+    def _apply_sufficiency_answer_hints(
+        self,
+        answer_result: AnswerResult,
+        sufficiency: dict[str, Any] | None,
+    ) -> AnswerResult:
+        """Inject structured answer hints emitted by sufficiency checking."""
+        if not isinstance(sufficiency, dict):
+            return answer_result
+        primary_answer = str(sufficiency.get("primary_answer") or "").strip()
+        answer_candidates = self._deduplicate_strings(
+            [
+                primary_answer,
+                *[
+                    str(value).strip()
+                    for value in sufficiency.get("answer_candidates", [])
+                    if str(value).strip()
+                ],
+            ]
+        )
+        answer_candidates = [
+            value for value in answer_candidates if self._is_propagatable_text(value)
+        ]
+        if not answer_candidates:
+            return answer_result
+        answer_result.predicted_answers = self._deduplicate_strings(
+            [*answer_candidates, *answer_result.predicted_answers]
+        )
+        answer_result.resolved_literals = self._deduplicate_strings(
+            [*answer_candidates, *answer_result.resolved_literals]
+        )
+        if self._is_propagatable_text(primary_answer):
+            answer_result.answer = primary_answer
+        elif answer_candidates and not self._is_propagatable_text(answer_result.answer):
+            answer_result.answer = answer_candidates[0]
+        return answer_result
 
     def _empty_question_analysis(self, question: str) -> QuestionAnalysisResult:
         """Return a minimal QuestionAnalysisResult for graceful error handling."""
@@ -1422,8 +1693,13 @@ class KGQAPipeline:
         """Inject resolved dependency answers into the current sub-question context."""
         dependency_literals: list[str] = []
         for dependency_id in sub_question.depends_on:
-            dependency_literals.extend(run_state.resolved_sub_answers.get(dependency_id, {}).get("literals", []))
-            dependency_literals.extend(run_state.resolved_sub_answers.get(dependency_id, {}).get("predicted_answers", []))
+            payload = run_state.resolved_sub_answers.get(dependency_id, {})
+            grounding = self._grounding_from_payload(payload)
+            dependency_literals.extend(grounding.answer_texts)
+            dependency_literals.extend(grounding.literal_values)
+            if not grounding.answer_texts and not grounding.literal_values:
+                dependency_literals.extend(payload.get("literals", []))
+                dependency_literals.extend(payload.get("predicted_answers", []))
         dependency_literals = self._deduplicate_strings(
             [value for value in dependency_literals if self._is_propagatable_text(value)]
         )
@@ -1463,7 +1739,12 @@ class KGQAPipeline:
             solver_type=sub_question.solver_type,
             solver_reason=sub_question.solver_reason,
             downstream_filters=list(sub_question.downstream_filters),
-            execution_hints=dict(sub_question.execution_hints),
+            execution_hints={
+                **dict(sub_question.execution_hints),
+                "question_interested_nodes": [
+                    item.to_dict() for item in sub_question.interested_nodes if item.name
+                ],
+            },
         )
 
     def _attach_downstream_filters_to_analysis(
@@ -1530,6 +1811,7 @@ class KGQAPipeline:
         plan_step: AgenticPlanStep,
         step_analysis: QuestionAnalysisResult,
         step_seed_ids: list[str],
+        constraint_target_ids: list[str],
         relation_ids: list[str],
         sub_question: SubQuestionSpec | None,
         resolved_sub_answers: dict[str, dict[str, Any]],
@@ -1556,6 +1838,7 @@ class KGQAPipeline:
             sub_question=target_sub_question,
             graph_api=graph_api,
             step_seed_ids=list(step_seed_ids),
+            constraint_target_ids=list(constraint_target_ids),
             relation_ids=list(relation_ids),
             resolved_sub_answers=resolved_sub_answers,
             execute_explore=lambda: self._execute_agentic_retrieval_step(
@@ -1706,7 +1989,320 @@ class KGQAPipeline:
                 summaries=step_summaries,
             )
         )
-        return self._deduplicate_strings([label for label in labels if self._is_propagatable_text(label)])
+        return self._sanitize_answer_candidate_texts(
+            [str(label).strip() for label in labels if str(label).strip()]
+        )
+
+    def _collect_answer_view_triples(
+        self,
+        step_summaries: list[dict[str, Any]],
+        pruned_paths: list[ReasoningPath],
+    ) -> list[dict[str, str]]:
+        """Collect answer-facing triples, preferring summary-provided answer-view triples."""
+        triples: list[dict[str, str]] = []
+        for item in step_summaries:
+            if not isinstance(item, dict):
+                continue
+            for triple in self._summary_fact_triples(item):
+                if not isinstance(triple, dict):
+                    continue
+                head = str(triple.get("head") or "").strip()
+                relation = str(triple.get("relation") or "").strip()
+                tail = str(triple.get("tail") or "").strip()
+                if head and relation and tail:
+                    triples.append({"head": head, "relation": relation, "tail": tail})
+        if triples:
+            deduped: list[dict[str, str]] = []
+            seen: set[tuple[str, str, str]] = set()
+            for triple in triples:
+                key = (triple["head"], triple["relation"], triple["tail"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(triple)
+            return deduped
+
+        for path in pruned_paths:
+            for triple in path.triples:
+                head = str(triple.head or "").strip()
+                relation = str(triple.relation or "").strip()
+                tail = str(triple.tail or "").strip()
+                if head and relation and tail:
+                    triples.append({"head": head, "relation": relation, "tail": tail})
+        deduped = []
+        seen = set()
+        for triple in triples:
+            key = (triple["head"], triple["relation"], triple["tail"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(triple)
+        return deduped
+
+    def _collect_answer_view_facts(
+        self,
+        step_summaries: list[dict[str, Any]],
+        pruned_paths: list[ReasoningPath],
+    ) -> list[dict[str, str]]:
+        """Collect answer-facing facts with stable ids, preferring summary-provided fact views."""
+        facts: list[dict[str, str]] = []
+        for item in step_summaries:
+            if not isinstance(item, dict):
+                continue
+            raw_facts = item.get("answer_view_facts")
+            if not isinstance(raw_facts, list):
+                continue
+            for fact in raw_facts:
+                if not isinstance(fact, dict):
+                    continue
+                facts.append(
+                    {
+                        "head_id": str(fact.get("head_id") or "").strip(),
+                        "head_label": str(fact.get("head_label") or "").strip(),
+                        "relation_id": str(fact.get("relation_id") or "").strip(),
+                        "tail_id": str(fact.get("tail_id") or "").strip(),
+                        "tail_label": str(fact.get("tail_label") or "").strip(),
+                        "tail_kind": str(fact.get("tail_kind") or "id").strip(),
+                    }
+                )
+        if not facts:
+            for path in pruned_paths:
+                path_facts = getattr(path, "triple_facts", [])
+                if path_facts:
+                    for fact in path_facts:
+                        facts.append(
+                            {
+                                "head_id": str(getattr(fact, "head_id", "") or "").strip(),
+                                "head_label": str(getattr(fact, "head_label", "") or "").strip(),
+                                "relation_id": str(getattr(fact, "relation_id", "") or "").strip(),
+                                "tail_id": str(getattr(fact, "tail_id", "") or "").strip(),
+                                "tail_label": str(getattr(fact, "tail_label", "") or "").strip(),
+                                "tail_kind": str(getattr(fact, "tail_kind", "id") or "id").strip(),
+                            }
+                        )
+                    continue
+                for index, edge_id in enumerate(getattr(path, "edge_ids", [])):
+                    parts = str(edge_id or "").split(":", 2)
+                    if len(parts) != 3:
+                        continue
+                    head_id, relation_id, tail_id = (part.strip() for part in parts)
+                    head_label = str(path.nodes[index] if index < len(path.nodes) else "").strip()
+                    tail_label = str(path.nodes[index + 1] if index + 1 < len(path.nodes) else "").strip()
+                    tail_kind = "id" if tail_id.startswith(("m.", "g.")) else "literal"
+                    facts.append(
+                        {
+                            "head_id": head_id if head_id.startswith(("m.", "g.")) else "",
+                            "head_label": head_label,
+                            "relation_id": relation_id,
+                            "tail_id": tail_id if tail_kind == "id" else "",
+                            "tail_label": tail_label,
+                            "tail_kind": tail_kind,
+                        }
+                    )
+        deduped: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for fact in facts:
+            key = (fact["head_id"], fact["relation_id"], fact["tail_id"], fact["tail_label"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(fact)
+        return deduped
+
+    def _resolve_grounding_entity_candidates(
+        self,
+        graph_api: Any,
+        candidate_labels: list[str],
+        candidate_entity_ids: list[str],
+        expected_type: str,
+    ) -> tuple[list[str], list[str], dict[str, int]]:
+        """Resolve and type-filter entity candidates for one grounding object."""
+        type_filter_stats = {
+            "type_filter_before_count": len(candidate_entity_ids) or len(candidate_labels),
+            "type_filter_after_count": len(candidate_entity_ids) or len(candidate_labels),
+        }
+        entity_ids = self._deduplicate_strings(candidate_entity_ids)
+        labels = self._deduplicate_strings(candidate_labels)
+        if self._filter_subquestion_candidates_enabled():
+            entity_ids, labels, type_filter_stats = self._filter_candidates_by_expected_type(
+                graph_api=graph_api,
+                expected_type=expected_type,
+                entity_ids=entity_ids,
+                labels=labels,
+            )
+        return entity_ids, labels, type_filter_stats
+
+    def _candidate_values_from_answer_view_facts(
+        self,
+        answer_view_facts: list[dict[str, str]],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Extract candidate entity ids, labels, and literals from fact tails."""
+        entity_ids: list[str] = []
+        entity_labels: list[str] = []
+        literal_values: list[str] = []
+        for fact in answer_view_facts:
+            if not isinstance(fact, dict):
+                continue
+            tail_id = str(fact.get("tail_id") or "").strip()
+            tail_label = str(fact.get("tail_label") or "").strip()
+            tail_kind = str(fact.get("tail_kind") or "id").strip().lower()
+            if tail_kind == "id" and tail_id:
+                entity_ids.append(tail_id)
+                if self._is_propagatable_text(tail_label):
+                    entity_labels.append(tail_label)
+            elif self._is_propagatable_text(tail_label):
+                literal_values.append(tail_label)
+        return (
+            self._deduplicate_strings(entity_ids),
+            self._deduplicate_strings(entity_labels),
+            self._deduplicate_strings(literal_values),
+        )
+
+    def _build_subquestion_grounding(
+        self,
+        *,
+        graph_api: Any,
+        sub_question: SubQuestionSpec,
+        pruned_paths: list[ReasoningPath],
+        step_summaries: list[dict[str, Any]],
+        answer_result: AnswerResult,
+        structured_outputs: dict[str, Any] | None = None,
+        primary_entity_ids: list[str] | None = None,
+        primary_literals: list[str] | None = None,
+    ) -> tuple[AnswerGrounding, dict[str, int]]:
+        """Construct canonical answer grounding for one sub-question."""
+        structured_outputs = structured_outputs or {}
+        answer_view_triples = self._collect_answer_view_triples(step_summaries, pruned_paths)
+        answer_view_facts = self._collect_answer_view_facts(step_summaries, pruned_paths)
+        fact_entity_ids, fact_entity_labels, fact_literal_values = self._candidate_values_from_answer_view_facts(
+            answer_view_facts
+        )
+        labels = self._collect_subquestion_output_labels(
+            sub_question=sub_question,
+            pruned_paths=pruned_paths,
+            step_summaries=step_summaries,
+            answer_result=answer_result,
+            structured_outputs=structured_outputs,
+            primary_literals=primary_literals,
+        )
+        summary_tail_labels = self._deduplicate_strings(
+            [
+                str(triple.get("tail") or "").strip()
+                for triple in answer_view_triples
+                if isinstance(triple, dict) and self._is_propagatable_text(str(triple.get("tail") or "").strip())
+            ]
+        )
+        candidate_labels = self._sanitize_answer_candidate_texts(fact_entity_labels + fact_literal_values + summary_tail_labels + labels)
+        evidence_entity_ids = self._extract_subquestion_entity_ids_from_evidence(
+            graph_api=graph_api,
+            sub_question=sub_question,
+            pruned_paths=pruned_paths,
+            step_summaries=step_summaries,
+            answer_result=answer_result,
+            literals=candidate_labels,
+        )
+        candidate_entity_ids = self._deduplicate_strings([*fact_entity_ids, *evidence_entity_ids, *(primary_entity_ids or [])])
+        canonical_entity_ids, canonical_labels, type_filter_stats = self._resolve_grounding_entity_candidates(
+            graph_api=graph_api,
+            candidate_labels=candidate_labels,
+            candidate_entity_ids=candidate_entity_ids,
+            expected_type=sub_question.expected_answer_type,
+        )
+
+        entity_labels: list[str] = []
+        primary_entity_id = ""
+        if canonical_entity_ids and graph_api is not None and hasattr(graph_api, "get_nodes_metadata_batched"):
+            metadata_by_id = graph_api.get_nodes_metadata_batched(canonical_entity_ids)
+            ordered_pairs = self._order_canonical_entity_candidates(
+                graph_api=graph_api,
+                entity_ids=canonical_entity_ids,
+                metadata_by_id=metadata_by_id,
+                step_summaries=step_summaries,
+            )
+            canonical_entity_ids = [entity_id for entity_id, _label in ordered_pairs][
+                : self._agentic_max_carryover_entities()
+            ]
+            entity_labels = self._deduplicate_strings(
+                [
+                    label
+                    for _entity_id, label in ordered_pairs
+                    if self._is_propagatable_text(label) and not self._looks_like_mid_or_cvt_id(label)
+                ]
+            )
+            if not entity_labels:
+                entity_labels = self._deduplicate_strings(
+                    [label for _entity_id, label in ordered_pairs if self._is_propagatable_text(label)]
+                )
+            if entity_labels:
+                normalized_labels = {self._normalize_relation_text(label) for label in entity_labels}
+                canonical_entity_ids = [
+                    entity_id
+                    for entity_id in canonical_entity_ids
+                    if self._normalize_relation_text(
+                        str(
+                            (
+                                metadata_by_id.get(entity_id).name
+                                if metadata_by_id.get(entity_id) is not None
+                                else graph_api.get_entity_display_name(entity_id)
+                            )
+                            or entity_id
+                        )
+                    )
+                    in normalized_labels
+                ] or canonical_entity_ids
+            if canonical_entity_ids:
+                primary_entity_id = canonical_entity_ids[0]
+
+        answer_texts = self._sanitize_answer_candidate_texts(
+            [*entity_labels, *canonical_labels]
+        )[: self._agentic_max_carryover_text_values()]
+        literal_values = self._sanitize_answer_candidate_texts(
+            [
+                str(value).strip()
+                for value in [
+                    *fact_literal_values,
+                    *(primary_literals or []),
+                    *getattr(answer_result, "resolved_literals", []),
+                    *canonical_labels,
+                ]
+                if str(value).strip()
+            ]
+        )[: self._agentic_max_carryover_text_values()]
+        if entity_labels:
+            literal_values = self._deduplicate_strings(
+                [value for value in literal_values if self._normalize_relation_text(value) not in {
+                    self._normalize_relation_text(label) for label in entity_labels
+                }]
+            )
+        primary_answer_text = (
+            answer_texts[0]
+            if answer_texts
+            else (literal_values[0] if literal_values else str(answer_result.answer or "").strip())
+        )
+        source_mode = "summary_tail_resolution" if answer_view_triples else "path_terminal"
+        grounding = AnswerGrounding(
+            answer_texts=list(answer_texts),
+            entity_ids=list(canonical_entity_ids),
+            entity_labels=list(entity_labels or answer_texts),
+            literal_values=list(literal_values),
+            primary_answer_text=primary_answer_text if self._is_propagatable_text(primary_answer_text) else "",
+            primary_entity_id=primary_entity_id,
+            answer_view_triples=list(answer_view_triples),
+            answer_view_facts=list(answer_view_facts),
+            supporting_relation_ids=self._collect_summary_relation_ids(step_summaries),
+            source_mode=source_mode,
+            confidence="high" if bool(answer_texts or canonical_entity_ids or literal_values) else "low",
+            debug={
+                "summary_tail_labels": list(summary_tail_labels[:8]),
+                "candidate_fact_entity_ids": list(fact_entity_ids[:8]),
+                "candidate_fact_labels": list((fact_entity_labels + fact_literal_values)[:8]),
+                "candidate_labels": list(candidate_labels[:8]),
+                "candidate_entity_ids": list(candidate_entity_ids[:8]),
+                "used_label_fallback": not bool(fact_entity_ids),
+                "type_filter_stats": dict(type_filter_stats),
+            },
+        )
+        return grounding, type_filter_stats
 
     def _canonicalize_subquestion_outputs(
         self,
@@ -1718,88 +2314,75 @@ class KGQAPipeline:
         structured_outputs: dict[str, Any] | None = None,
         primary_entity_ids: list[str] | None = None,
         primary_literals: list[str] | None = None,
-    ) -> tuple[list[str], list[str], dict[str, int]]:
-        """Resolve one canonical set of sub-question entities/labels before state propagation."""
-        labels = self._collect_subquestion_output_labels(
-            sub_question=sub_question,
-            pruned_paths=pruned_paths,
-            step_summaries=step_summaries,
-            answer_result=answer_result,
-            structured_outputs=structured_outputs,
-            primary_literals=primary_literals,
-        )
-        evidence_entity_ids = self._extract_subquestion_entity_ids_from_evidence(
+    ) -> tuple[AnswerGrounding, dict[str, int]]:
+        """Resolve one canonical answer grounding before state propagation."""
+        grounding, type_filter_stats = self._build_subquestion_grounding(
             graph_api=graph_api,
             sub_question=sub_question,
             pruned_paths=pruned_paths,
             step_summaries=step_summaries,
             answer_result=answer_result,
-            literals=labels,
+            structured_outputs=structured_outputs,
+            primary_entity_ids=primary_entity_ids,
+            primary_literals=primary_literals,
         )
-        candidate_entity_ids = self._deduplicate_strings(
-            [
-                *evidence_entity_ids,
-                *(primary_entity_ids or []),
-            ]
-        )
+        self._project_grounding_to_answer_result(answer_result, grounding)
+        return grounding, type_filter_stats
 
-        type_filter_stats = {
-            "type_filter_before_count": len(candidate_entity_ids) or len(labels),
-            "type_filter_after_count": len(candidate_entity_ids) or len(labels),
-        }
-        if self._filter_subquestion_candidates_enabled():
-            candidate_entity_ids, labels, type_filter_stats = self._filter_candidates_by_expected_type(
-                graph_api=graph_api,
-                expected_type=sub_question.expected_answer_type,
-                entity_ids=candidate_entity_ids,
-                labels=labels,
-            )
+    def _order_canonical_entity_candidates(
+        self,
+        *,
+        graph_api: Any,
+        entity_ids: list[str],
+        metadata_by_id: dict[str, Any],
+        step_summaries: list[dict[str, Any]],
+    ) -> list[tuple[str, str]]:
+        """Prefer leaf answer nodes over bridge/CVT-like intermediate nodes."""
+        head_labels: set[str] = set()
+        tail_labels: set[str] = set()
+        for item in step_summaries:
+            if not isinstance(item, dict):
+                continue
+            for triple in self._summary_fact_triples(item):
+                if not isinstance(triple, dict):
+                    continue
+                head = self._normalize_relation_text(str(triple.get("head") or ""))
+                tail = self._normalize_relation_text(str(triple.get("tail") or ""))
+                if head:
+                    head_labels.add(head)
+                if tail:
+                    tail_labels.add(tail)
 
-        canonical_labels = self._deduplicate_strings(
-            [label for label in labels if self._is_propagatable_text(label)]
-        )[: self._agentic_max_carryover_text_values()]
-        canonical_entity_ids = self._deduplicate_strings(candidate_entity_ids)[: self._agentic_max_carryover_entities()]
+        scored: list[tuple[float, str, str]] = []
+        for entity_id in entity_ids:
+            metadata = metadata_by_id.get(entity_id)
+            label = str(
+                (
+                    metadata.name
+                    if metadata is not None and str(getattr(metadata, "name", "") or "").strip()
+                    else graph_api.get_entity_display_name(entity_id)
+                )
+                or entity_id
+            ).strip()
+            normalized_label = self._normalize_relation_text(label)
+            score = 0.0
+            if normalized_label in tail_labels:
+                score += 2.0
+            if normalized_label in head_labels:
+                score -= 1.5
+            if not self._looks_like_mid_or_cvt_id(label):
+                score += 1.0
+            if self._looks_like_mid_or_cvt_id(label):
+                score -= 1.0
+            scored.append((score, entity_id, label))
+        scored.sort(key=lambda item: (-item[0], item[2]))
+        return [(entity_id, label) for _score, entity_id, label in scored]
 
-        if canonical_entity_ids and graph_api is not None and hasattr(graph_api, "get_nodes_metadata_batched"):
-            metadata_by_id = graph_api.get_nodes_metadata_batched(canonical_entity_ids)
-            metadata_labels = self._deduplicate_strings(
-                [
-                    str(
-                        (
-                            metadata_by_id.get(entity_id).name
-                            if metadata_by_id.get(entity_id) is not None
-                            else graph_api.get_entity_display_name(entity_id)
-                        )
-                        or ""
-                    ).strip()
-                    for entity_id in canonical_entity_ids
-                    if str(
-                        (
-                            metadata_by_id.get(entity_id).name
-                            if metadata_by_id.get(entity_id) is not None
-                            else graph_api.get_entity_display_name(entity_id)
-                        )
-                        or ""
-                    ).strip()
-                ]
-            )
-            if metadata_labels:
-                canonical_labels = metadata_labels[: self._agentic_max_carryover_text_values()]
-
-        if canonical_labels:
-            answer_result.predicted_answers = list(canonical_labels)
-            answer_result.resolved_literals = self._deduplicate_strings(
-                list(canonical_labels) + list(answer_result.resolved_literals)
-            )[: self._agentic_max_carryover_text_values()]
-            answer_result.resolved_entity_mentions = list(canonical_labels)
-            if (
-                not self._is_propagatable_text(answer_result.answer)
-                or self._normalize_relation_text(answer_result.answer)
-                not in {self._normalize_relation_text(label) for label in canonical_labels}
-            ):
-                answer_result.answer = canonical_labels[0]
-
-        return canonical_entity_ids, canonical_labels, type_filter_stats
+    @staticmethod
+    def _looks_like_mid_or_cvt_id(value: str) -> bool:
+        """Return whether a label still looks like a raw Freebase id."""
+        normalized = str(value).strip()
+        return normalized.startswith("m.") or normalized.startswith("g.")
 
     def _extract_subquestion_entity_ids_from_evidence(
         self,
@@ -1813,6 +2396,18 @@ class KGQAPipeline:
         """Prefer summary-level answer tails over intermediate path terminals."""
         if graph_api is None:
             return []
+        answer_view_facts = self._collect_answer_view_facts(step_summaries, pruned_paths)
+        fact_entity_ids = self._deduplicate_strings(
+            [
+                str(fact.get("tail_id") or "").strip()
+                for fact in answer_view_facts
+                if isinstance(fact, dict)
+                and str(fact.get("tail_kind") or "id").strip().lower() == "id"
+                and str(fact.get("tail_id") or "").strip()
+            ]
+        )
+        if fact_entity_ids:
+            return fact_entity_ids
         expected_type = self._normalize_relation_text(sub_question.expected_answer_type)
         labels = {
             self._normalize_relation_text(value)
@@ -1867,16 +2462,16 @@ class KGQAPipeline:
         for item in step_summaries:
             if not isinstance(item, dict):
                 continue
-            for triple in item.get("key_triples", []):
+            for triple in self._summary_fact_triples(item):
                 if not isinstance(triple, dict):
                     continue
-                tail = str(triple.get("tail") or "").strip()
-                if not tail:
-                    continue
-                normalized_tail = self._normalize_relation_text(tail)
-                fallback_tail_labels.append(tail)
-                if labels and normalized_tail and normalized_tail in labels:
-                    preferred_tail_labels.append(tail)
+            tail = str(triple.get("tail") or "").strip()
+            if not tail:
+                continue
+            normalized_tail = self._normalize_relation_text(tail)
+            fallback_tail_labels.append(tail)
+            if labels and normalized_tail and normalized_tail in labels:
+                preferred_tail_labels.append(tail)
         summary_tail_labels = self._deduplicate_strings(preferred_tail_labels or fallback_tail_labels)
         if not summary_tail_labels:
             return []
@@ -1935,10 +2530,13 @@ class KGQAPipeline:
             payload = agentic_state.resolved_sub_answers.get(sub_question_id, {})
             if not isinstance(payload, dict):
                 continue
+            grounding = self._grounding_from_payload(payload)
             values = [
+                *[str(value).strip() for value in grounding.answer_texts if str(value).strip()],
+                *[str(value).strip() for value in grounding.literal_values if str(value).strip()],
                 *[str(value).strip() for value in payload.get("predicted_answers", []) if str(value).strip()],
                 *[str(value).strip() for value in payload.get("literals", []) if str(value).strip()],
-                str(payload.get("answer") or "").strip(),
+                grounding.primary_answer_text or str(payload.get("answer") or "").strip(),
             ]
             filtered = [value for value in values if self._is_best_effort_candidate_text(value)]
             if filtered:
@@ -1970,13 +2568,141 @@ class KGQAPipeline:
         for item in summarized_paths:
             if not isinstance(item, dict):
                 continue
-            for triple in item.get("key_triples", []):
+            grounding = item.get("grounding")
+            if isinstance(grounding, dict):
+                labels.extend(
+                    str(value).strip()
+                    for value in grounding.get("answer_texts", [])
+                    if str(value).strip()
+                )
+            for triple in self._summary_fact_triples(item):
                 if not isinstance(triple, dict):
                     continue
                 tail = str(triple.get("tail") or "").strip()
                 if tail:
                     labels.append(tail)
         return self._deduplicate_strings([label for label in labels if self._is_best_effort_candidate_text(label)])
+
+    def _build_final_grounding(
+        self,
+        *,
+        graph_api: Any,
+        question_analysis: QuestionAnalysisResult,
+        summarized_paths: list[dict[str, Any]],
+        answer_result: AnswerResult,
+        source_mode: str,
+    ) -> AnswerGrounding:
+        """Construct canonical final-answer grounding from summaries and answer outputs."""
+        answer_view_triples = self._collect_answer_view_triples(summarized_paths, [])
+        answer_view_facts = self._collect_answer_view_facts(summarized_paths, [])
+        resolved_grounding_entity_ids: list[str] = []
+        for item in summarized_paths:
+            if not isinstance(item, dict):
+                continue
+            resolved = item.get("resolved_sub_answers", {})
+            if not isinstance(resolved, dict):
+                continue
+            for payload in resolved.values():
+                if not isinstance(payload, dict):
+                    continue
+                grounding = self._grounding_from_payload(payload)
+                resolved_grounding_entity_ids.extend(
+                    [
+                        *([grounding.primary_entity_id] if grounding.primary_entity_id else []),
+                        *grounding.entity_ids,
+                    ]
+                )
+                answer_view_facts.extend(
+                    [
+                        {
+                            "head_id": str(fact.get("head_id") or "").strip(),
+                            "head_label": str(fact.get("head_label") or "").strip(),
+                            "relation_id": str(fact.get("relation_id") or "").strip(),
+                            "tail_id": str(fact.get("tail_id") or "").strip(),
+                            "tail_label": str(fact.get("tail_label") or "").strip(),
+                            "tail_kind": str(fact.get("tail_kind") or "id").strip(),
+                        }
+                        for fact in grounding.answer_view_facts
+                        if isinstance(fact, dict)
+                    ]
+        )
+        fact_entity_ids, fact_entity_labels, fact_literal_values = self._candidate_values_from_answer_view_facts(
+            answer_view_facts
+        )
+        fact_entity_ids = self._deduplicate_strings([*resolved_grounding_entity_ids, *fact_entity_ids])
+        llm_labels = self._deduplicate_strings(
+            [
+                str(answer_result.answer or "").strip(),
+                *[
+                    str(value).strip()
+                    for value in answer_result.predicted_answers
+                    if self._is_propagatable_text(str(value).strip())
+                ],
+                *[
+                    str(value).strip()
+                    for value in answer_result.resolved_literals
+                    if self._is_propagatable_text(str(value).strip())
+                ],
+                *[
+                    str(value).strip()
+                    for value in answer_result.resolved_entity_mentions
+                    if self._is_propagatable_text(str(value).strip())
+                ],
+            ]
+        )
+        llm_labels = self._sanitize_answer_candidate_texts(llm_labels)
+        fallback_fact_labels = self._sanitize_answer_candidate_texts(
+            [
+                *fact_entity_labels,
+                *fact_literal_values,
+                *[
+                    str(triple.get("tail") or "").strip()
+                    for triple in answer_view_triples
+                    if self._is_propagatable_text(str(triple.get("tail") or "").strip())
+                ],
+            ]
+        )
+        labels = list(llm_labels or fallback_fact_labels)
+        entity_ids: list[str] = list(fact_entity_ids)
+        if graph_api is not None and hasattr(graph_api, "resolve_entity_mentions"):
+            for label in labels[:10]:
+                entity_ids.extend(graph_api.resolve_entity_mentions([label], top_k=3))
+        entity_ids = self._deduplicate_strings(entity_ids)
+        expected_type = self._question_expected_answer_type(question_analysis)
+        entity_ids, entity_labels, _ = self._resolve_grounding_entity_candidates(
+            graph_api=graph_api,
+            candidate_labels=labels,
+            candidate_entity_ids=entity_ids,
+            expected_type=expected_type,
+        )
+        answer_texts = self._deduplicate_strings(llm_labels or entity_labels or labels)
+        literal_values = self._deduplicate_strings(
+            [label for label in (llm_labels or labels) if self._normalize_relation_text(label) not in {
+                self._normalize_relation_text(entity_label) for entity_label in entity_labels
+            }]
+        )
+        grounding = AnswerGrounding(
+            answer_texts=list(answer_texts),
+            entity_ids=list(entity_ids),
+            entity_labels=list(entity_labels or answer_texts),
+            literal_values=list(literal_values),
+            primary_answer_text=answer_texts[0] if answer_texts else "",
+            primary_entity_id=entity_ids[0] if entity_ids else "",
+            answer_view_triples=list(answer_view_triples),
+            answer_view_facts=list(answer_view_facts),
+            supporting_relation_ids=self._collect_summary_relation_ids(summarized_paths),
+            source_mode=source_mode,
+            confidence="low" if source_mode == "best_effort" else "high",
+            debug={
+                "expected_type": expected_type,
+                "llm_labels": list(llm_labels[:8]),
+                "fallback_fact_labels": list(fallback_fact_labels[:8]),
+                "fact_entity_ids": list(fact_entity_ids[:8]),
+                "label_resolved_entity_ids": list(entity_ids[:8]),
+                "source_mode": source_mode,
+            },
+        )
+        return grounding
 
     def _apply_best_effort_answer_selection(
         self,
@@ -1986,6 +2712,7 @@ class KGQAPipeline:
         candidate_paths: list[ReasoningPath],
         summarized_paths: list[dict[str, Any]],
         answer_result: AnswerResult,
+        sufficiency: dict[str, Any] | None,
         agentic_state: AgenticRunState | None,
         trace: list[SearchTraceStep],
         depth: int,
@@ -1993,10 +2720,31 @@ class KGQAPipeline:
         """Inject a low-confidence answer from evidence when strict answering is insufficient."""
         if not self._best_effort_answering_enabled():
             return answer_result
-        if answer_result.predicted_answers and self._is_best_effort_candidate_text(answer_result.answer):
+        if answer_result.grounding and answer_result.grounding.answer_texts and self._is_best_effort_candidate_text(answer_result.answer):
             return answer_result
+        answer_result = self._apply_sufficiency_answer_hints(answer_result, sufficiency)
+        sufficiency_candidates = self._deduplicate_strings(
+            [
+                str(sufficiency.get("primary_answer") or "").strip()
+                if isinstance(sufficiency, dict)
+                else "",
+                *(
+                    [
+                        str(value).strip()
+                        for value in sufficiency.get("answer_candidates", [])
+                        if str(value).strip()
+                    ]
+                    if isinstance(sufficiency, dict)
+                    else []
+                ),
+            ]
+        )
+        sufficiency_candidates = [
+            value for value in sufficiency_candidates if self._is_best_effort_candidate_text(value)
+        ]
         candidates = self._deduplicate_strings(
             [
+                *sufficiency_candidates,
                 *self._collect_best_effort_candidates_from_subanswers(question_analysis, agentic_state),
                 *[str(value).strip() for value in answer_result.predicted_answers if str(value).strip()],
                 *[str(value).strip() for value in answer_result.resolved_literals if str(value).strip()],
@@ -2009,13 +2757,18 @@ class KGQAPipeline:
         candidates = [value for value in candidates if self._is_best_effort_candidate_text(value)]
         if not candidates:
             return answer_result
-        if not answer_result.predicted_answers:
-            answer_result.predicted_answers = list(candidates)
-        if not self._is_best_effort_candidate_text(answer_result.answer):
-            answer_result.answer = candidates[0]
+        answer_result.predicted_answers = list(candidates)
         answer_result.resolved_literals = self._deduplicate_strings(
             list(answer_result.resolved_literals) + list(candidates[:3])
         )
+        answer_result.grounding = self._build_final_grounding(
+            graph_api=self.graph_api,
+            question_analysis=question_analysis,
+            summarized_paths=summarized_paths,
+            answer_result=answer_result,
+            source_mode="best_effort",
+        )
+        self._project_grounding_to_answer_result(answer_result, answer_result.grounding)
         trace.append(
             SearchTraceStep(
                 stage="best_effort_answering",
@@ -2050,23 +2803,37 @@ class KGQAPipeline:
         expected_type = self._question_expected_answer_type(question_analysis)
         if not expected_type:
             return answer_result
-        _, filtered_labels, _ = self._filter_candidates_by_expected_type(
+        grounding = answer_result.grounding or self._build_final_grounding(
+            graph_api=graph_api,
+            question_analysis=question_analysis,
+            summarized_paths=[],
+            answer_result=answer_result,
+            source_mode="llm_answer",
+        )
+        filtered_ids, filtered_labels, _ = self._filter_candidates_by_expected_type(
             graph_api=graph_api,
             expected_type=expected_type,
-            entity_ids=[],
+            entity_ids=grounding.entity_ids,
             labels=[
-                *answer_result.predicted_answers,
-                *answer_result.resolved_literals,
-                *answer_result.resolved_entity_mentions,
+                *grounding.answer_texts,
+                *grounding.entity_labels,
+                *grounding.literal_values,
             ],
         )
         if not filtered_labels:
             return answer_result
-        answer_result.predicted_answers = list(filtered_labels)
-        answer_result.resolved_literals = self._deduplicate_strings(
-            list(answer_result.resolved_literals) + list(filtered_labels)
+        grounding.entity_ids = list(filtered_ids)
+        grounding.entity_labels = list(filtered_labels)
+        grounding.answer_texts = list(filtered_labels)
+        grounding.literal_values = self._deduplicate_strings(
+            [value for value in grounding.literal_values if self._normalize_relation_text(value) in {
+                self._normalize_relation_text(label) for label in filtered_labels
+            }]
         )
-        answer_result.answer = filtered_labels[0]
+        grounding.primary_answer_text = filtered_labels[0]
+        grounding.primary_entity_id = filtered_ids[0] if filtered_ids else ""
+        answer_result.grounding = grounding
+        self._project_grounding_to_answer_result(answer_result, grounding)
         return answer_result
 
     def _subquestion_outputs_match_expected_type(
@@ -2083,6 +2850,10 @@ class KGQAPipeline:
             return True
         if graph_api is None or not hasattr(graph_api, "get_nodes_metadata_batched"):
             return True
+
+        grounding = answer_result.grounding or self._empty_answer_grounding()
+        entity_ids = self._deduplicate_strings(list(grounding.entity_ids) + list(entity_ids))
+        literals = self._deduplicate_strings(list(grounding.answer_texts) + list(grounding.literal_values) + list(literals))
 
         candidate_ids = self._deduplicate_strings(list(entity_ids))
         if not candidate_ids and hasattr(graph_api, "resolve_entity_mentions"):
@@ -2107,6 +2878,113 @@ class KGQAPipeline:
                 return True
         return False
 
+    def _evaluate_subquestion_output_type(
+        self,
+        *,
+        graph_api: Any,
+        sub_question: SubQuestionSpec,
+        entity_ids: list[str],
+        literals: list[str],
+        answer_result: AnswerResult,
+        step_summaries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Return a structured type-check result for sub-question outputs."""
+        expected_type = self._normalize_relation_text(sub_question.expected_answer_type)
+        if not expected_type:
+            return {
+                "passed": True,
+                "soft_pass": False,
+                "mode": "disabled",
+                "hard_match": True,
+                "relation_score": 0.0,
+                "embedding_score": 0.0,
+            }
+
+        grounding = answer_result.grounding or self._empty_answer_grounding()
+        entity_ids = self._deduplicate_strings(list(grounding.entity_ids) + list(entity_ids))
+        literals = self._deduplicate_strings(list(grounding.answer_texts) + list(grounding.literal_values) + list(literals))
+
+        hard_match = self._subquestion_outputs_match_expected_type(
+            graph_api=graph_api,
+            sub_question=sub_question,
+            entity_ids=entity_ids,
+            literals=literals,
+            answer_result=answer_result,
+        )
+        relation_texts = self._collect_summary_relation_texts(step_summaries)
+        candidate_texts = self._deduplicate_strings(
+            [
+                *entity_ids,
+                *literals,
+                *grounding.entity_labels,
+                *answer_result.predicted_answers,
+                *answer_result.resolved_literals,
+                *answer_result.resolved_entity_mentions,
+            ]
+        )
+        candidate_texts = self._sanitize_answer_candidate_texts(candidate_texts)
+        relation_score = self._relation_type_soft_score(expected_type, relation_texts)
+        embedding_score = self._embedding_type_soft_score(
+            graph_api=graph_api,
+            expected_type=expected_type,
+            entity_ids=entity_ids,
+            candidate_texts=candidate_texts,
+            relation_texts=relation_texts,
+        )
+        soft_pass = False
+        mode = "hard_fail"
+        if hard_match:
+            mode = "hard_match"
+        else:
+            soft_pass = self._subquestion_outputs_soft_match_expected_type(
+                graph_api=graph_api,
+                sub_question=sub_question,
+                entity_ids=entity_ids,
+                literals=literals,
+                answer_result=answer_result,
+                step_summaries=step_summaries,
+            )
+            if soft_pass:
+                if relation_score >= 0.72 and embedding_score >= 0.32:
+                    mode = "relation_embedding_soft"
+                elif embedding_score >= 0.58:
+                    mode = "embedding_soft"
+                else:
+                    mode = "alias_soft"
+        return {
+            "passed": bool(hard_match or soft_pass),
+            "soft_pass": bool(soft_pass),
+            "mode": mode,
+            "hard_match": bool(hard_match),
+            "relation_score": float(relation_score),
+            "embedding_score": float(embedding_score),
+        }
+
+    def _should_bypass_boolean_subquestion_type_check(
+        self,
+        *,
+        sub_question: SubQuestionSpec,
+        answer_result: AnswerResult,
+        sufficiency: dict[str, Any],
+    ) -> bool:
+        """Allow explicit yes/no verify answers through when evidence already proved the boolean claim."""
+        expected_type = self._normalize_relation_text(sub_question.expected_answer_type)
+        if expected_type != "boolean":
+            return False
+        if not bool(sufficiency.get("sufficient", False)):
+            return False
+        candidates = self._deduplicate_strings(
+            [
+                str(answer_result.answer or "").strip(),
+                *[str(value).strip() for value in answer_result.predicted_answers if str(value).strip()],
+                *[str(value).strip() for value in answer_result.resolved_literals if str(value).strip()],
+                str(sufficiency.get("primary_answer") or "").strip(),
+                *[str(value).strip() for value in sufficiency.get("answer_candidates", []) if str(value).strip()],
+            ]
+        )
+        normalized = {self._normalize_relation_text(value) for value in candidates if value}
+        return bool(normalized & {"yes", "no", "true", "false"})
+
     def _subquestion_outputs_soft_match_expected_type(
         self,
         *,
@@ -2125,6 +3003,10 @@ class KGQAPipeline:
         expected_type = self._normalize_relation_text(sub_question.expected_answer_type)
         if not expected_type:
             return False
+
+        grounding = answer_result.grounding or self._empty_answer_grounding()
+        entity_ids = self._deduplicate_strings(list(grounding.entity_ids) + list(entity_ids))
+        literals = self._deduplicate_strings(list(grounding.answer_texts) + list(grounding.literal_values) + list(literals))
 
         alias_tokens = {
             token
@@ -2148,16 +3030,19 @@ class KGQAPipeline:
         alias_tokens.update(lexical_alias_map.get(expected_type, set()))
         if not alias_tokens:
             return False
+        relation_texts = self._collect_summary_relation_texts(step_summaries)
 
         candidate_texts = self._deduplicate_strings(
             [
                 *entity_ids,
                 *literals,
+                *grounding.entity_labels,
                 *answer_result.predicted_answers,
                 *answer_result.resolved_literals,
                 *answer_result.resolved_entity_mentions,
             ]
         )
+        candidate_texts = self._sanitize_answer_candidate_texts(candidate_texts)
         if graph_api is not None and hasattr(graph_api, "resolve_entity_mentions"):
             resolved_ids = list(entity_ids)
             label_candidates = [value for value in candidate_texts if self._is_propagatable_text(value)]
@@ -2176,12 +3061,138 @@ class KGQAPipeline:
                         return True
                     if self._expected_type_allows_name_match(expected_type) and any(token in name_text for token in alias_tokens):
                         return True
+        for relation_text in relation_texts:
+            if any(token in relation_text for token in alias_tokens):
+                return True
 
         for value in candidate_texts:
             haystack = self._normalize_relation_text(value)
             if any(token in haystack for token in alias_tokens):
                 return True
+        relation_score = self._relation_type_soft_score(expected_type, relation_texts)
+        embedding_score = self._embedding_type_soft_score(
+            graph_api=graph_api,
+            expected_type=expected_type,
+            entity_ids=entity_ids,
+            candidate_texts=candidate_texts,
+            relation_texts=relation_texts,
+        )
+        if relation_score >= 0.72 and embedding_score >= 0.32:
+            return True
+        if embedding_score >= 0.58:
+            return True
         return False
+
+    def _collect_summary_relation_texts(
+        self,
+        step_summaries: list[dict[str, Any]],
+    ) -> list[str]:
+        """Collect normalized relation strings from summarized evidence."""
+        relation_texts: list[str] = []
+        for item in step_summaries:
+            if not isinstance(item, dict):
+                continue
+            for triple in self._summary_fact_triples(item):
+                if not isinstance(triple, dict):
+                    continue
+                relation = str(triple.get("relation") or "").strip()
+                if not relation:
+                    continue
+                relation_texts.append(self._normalize_relation_text(relation.replace(".", " ").replace("_", " ")))
+        return self._deduplicate_strings([text for text in relation_texts if text])
+
+    def _relation_type_soft_score(
+        self,
+        expected_type: str,
+        relation_texts: list[str],
+    ) -> float:
+        """Estimate whether relation semantics imply the expected answer type."""
+        if not expected_type or not relation_texts:
+            return 0.0
+        aliases = self._expected_type_aliases(expected_type)
+        best = 0.0
+        for relation_text in relation_texts:
+            normalized_relation = self._normalize_relation_text(relation_text)
+            for alias in aliases:
+                normalized_alias = self._normalize_relation_text(alias)
+                if not normalized_alias:
+                    continue
+                if normalized_alias in normalized_relation:
+                    best = max(best, 1.0)
+                alias_tokens = [token for token in normalized_alias.split() if len(token) > 2]
+                overlap = 0.0
+                if alias_tokens:
+                    relation_tokens = set(normalized_relation.split())
+                    overlap = len(relation_tokens & set(alias_tokens)) / max(len(alias_tokens), 1)
+                best = max(best, overlap)
+        return best
+
+    def _embedding_type_soft_score(
+        self,
+        *,
+        graph_api: Any,
+        expected_type: str,
+        entity_ids: list[str],
+        candidate_texts: list[str],
+        relation_texts: list[str],
+    ) -> float:
+        """Use the shared embedding model to score candidate/type semantic compatibility."""
+        if not expected_type:
+            return 0.0
+        evidence_texts = self._deduplicate_strings(
+            [
+                *relation_texts,
+                *[text for text in candidate_texts if self._is_propagatable_text(text)],
+            ]
+        )
+        if graph_api is not None and entity_ids and hasattr(graph_api, "get_nodes_metadata_batched"):
+            metadata_by_id = graph_api.get_nodes_metadata_batched(entity_ids[:5])
+            for entity_id in entity_ids[:5]:
+                metadata = metadata_by_id.get(entity_id)
+                if metadata is None:
+                    continue
+                evidence_texts.append(
+                    self._normalize_relation_text(
+                        " ".join(
+                            [
+                                str(getattr(metadata, "name", "") or ""),
+                                *[str(value) for value in getattr(metadata, "types", ()) if value],
+                            ]
+                        )
+                    )
+                )
+        evidence_texts = self._deduplicate_strings([text for text in evidence_texts if text])[:8]
+        if not evidence_texts:
+            return 0.0
+        type_queries = self._deduplicate_strings(
+            [
+                self._normalize_relation_text(expected_type),
+                *[self._normalize_relation_text(alias) for alias in self._expected_type_aliases(expected_type)],
+            ]
+        )[:8]
+        if not type_queries:
+            return 0.0
+        try:
+            import numpy as np
+            from sklearn.metrics.pairwise import cosine_similarity
+        except ImportError:
+            return 0.0
+        try:
+            model = get_entity_embedding_model(self.config["embedding"]["model"])
+            query_embeddings = np.asarray(self._encode_embedding_texts(model, type_queries))
+            evidence_embeddings = np.asarray(self._encode_embedding_texts(model, evidence_texts))
+            similarities = cosine_similarity(query_embeddings, evidence_embeddings)
+            return float(similarities.max()) if similarities.size else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _encode_embedding_texts(model: object, texts: list[str]) -> Any:
+        """Encode texts without progress bars when the backend supports it."""
+        try:
+            return model.encode(texts, show_progress_bar=False)
+        except TypeError:
+            return model.encode(texts)
 
     def _expected_type_aliases(self, expected_type: str) -> set[str]:
         normalized = self._normalize_relation_text(expected_type)
@@ -2192,6 +3203,11 @@ class KGQAPipeline:
                 "sovereign state",
                 "nation",
                 "location administrative division",
+                "constituent country",
+                "administrative division",
+                "first level administrative division",
+                "dependent territory",
+                "region",
             ),
             "nation": (
                 "location country",
@@ -2199,6 +3215,11 @@ class KGQAPipeline:
                 "sovereign state",
                 "nation",
                 "location administrative division",
+                "constituent country",
+                "administrative division",
+                "first level administrative division",
+                "dependent territory",
+                "region",
             ),
             "person": ("people person", "person", "deceased person", "celebrities celebrity"),
             "city": (
@@ -2431,8 +3452,18 @@ class KGQAPipeline:
             "null",
             "not enough evidence",
             "no evidence",
+            "i am sorry",
+            "the provided evidence",
+            "does not contain the name",
+            "machine id",
         )
         return not any(marker in lowered for marker in blocked_markers)
+
+    def _sanitize_answer_candidate_texts(self, values: list[str]) -> list[str]:
+        """Drop failure-like explanations so they cannot be mistaken for answer candidates."""
+        return self._deduplicate_strings(
+            [value for value in values if self._is_propagatable_text(str(value).strip())]
+        )
 
     def _agentic_step_to_sub_question(
         self,
@@ -2572,6 +3603,7 @@ class KGQAPipeline:
             plan_step=plan_step,
             sub_question=sub_question,
             resolved_sub_answers=resolved_sub_answers,
+            graph_api=graph_api,
         )
         beam_config = self._relation_beam_config()
         if sub_question is not None and int(sub_question.expected_hop or 0) > 0:
@@ -2630,6 +3662,7 @@ class KGQAPipeline:
         plan_step: AgenticPlanStep,
         sub_question: SubQuestionSpec | None,
         resolved_sub_answers: dict[str, dict[str, Any]],
+        graph_api: Any,
     ) -> tuple[list[str], list[str], list[dict[str, Any]]]:
         """Build a compact, structured sub-question context for relation-beam planning."""
         anchor_mentions = self._deduplicate_strings(
@@ -2651,10 +3684,22 @@ class KGQAPipeline:
         resolved_dependencies = [
             {
                 "sub_question_id": dependency_id,
-                "answer": resolved_sub_answers.get(dependency_id, {}).get("answer", ""),
-                "predicted_answers": resolved_sub_answers.get(dependency_id, {}).get("predicted_answers", []),
-                "entity_ids": resolved_sub_answers.get(dependency_id, {}).get("entity_ids", []),
-                "literals": resolved_sub_answers.get(dependency_id, {}).get("literals", []),
+                "answer": (
+                    self._grounding_from_payload(resolved_sub_answers.get(dependency_id, {})).primary_answer_text
+                    or resolved_sub_answers.get(dependency_id, {}).get("answer", "")
+                ),
+                "predicted_answers": (
+                    self._grounding_from_payload(resolved_sub_answers.get(dependency_id, {})).answer_texts
+                    or resolved_sub_answers.get(dependency_id, {}).get("predicted_answers", [])
+                ),
+                "entity_ids": self._dependency_payload_seed_entity_ids(
+                    payload=resolved_sub_answers.get(dependency_id, {}),
+                    graph_api=graph_api,
+                ),
+                "literals": (
+                    self._grounding_from_payload(resolved_sub_answers.get(dependency_id, {})).literal_values
+                    or resolved_sub_answers.get(dependency_id, {}).get("literals", [])
+                ),
             }
             for dependency_id in dependency_ids
             if dependency_id in resolved_sub_answers
@@ -2747,7 +3792,7 @@ class KGQAPipeline:
         """Project current-step outputs into next-step entity frontier and text constraints."""
         texts: list[str] = []
         for item in step_summaries:
-            for triple in item.get("key_triples", []):
+            for triple in self._summary_fact_triples(item):
                 if not isinstance(triple, dict):
                     continue
                 tail = str(triple.get("tail") or "").strip()
@@ -2917,6 +3962,7 @@ class KGQAPipeline:
             sample_id=sample_id,
             gold_answers=gold_answers,
             predicted_answers=answer_result.predicted_answers,
+            final_grounding=self._grounding_to_dict(answer_result.grounding),
             search_trace=trace,
             alignment_debug=alignment_debug,
         )
@@ -3081,8 +4127,23 @@ class KGQAPipeline:
         graph_api: Any,
     ) -> ResolvedSubQuestion:
         """Resolve one CWQ sub-question into retrieval seeds only."""
+        question_interested_node_specs = [
+            EntityMentionSpec(
+                name=str(item.get("name") or "").strip(),
+                aliases=[str(value).strip() for value in item.get("aliases", []) if str(value).strip()],
+                expected_type=str(item.get("expected_type") or "").strip(),
+                role=str(item.get("role") or "constraint_or_anchor").strip(),
+            )
+            for item in (sub_question.execution_hints.get("question_interested_nodes", []) or [])
+            if str(item.get("name") or "").strip()
+        ]
         topic_entity_candidates = self._resolve_entity_specs_with_sqlite(
             specs=self._effective_sub_question_topics(sub_question),
+            graph_api=graph_api,
+            context_text=sub_question.question,
+        )
+        interested_node_candidates = self._resolve_entity_specs_with_sqlite(
+            specs=question_interested_node_specs,
             graph_api=graph_api,
             context_text=sub_question.question,
         )
@@ -3105,18 +4166,22 @@ class KGQAPipeline:
         if filtered_seed_node_ids:
             seed_node_ids = filtered_seed_node_ids
         resolution_debug = {
-            "interested_nodes_mode": "local_path_filter_only",
+            "interested_nodes_mode": "question_only_constraint_targets_plus_local_path_filter",
             "relation_hints_mode": "local_path_filter_only",
             "selected_relation_ids": [],
             "anchor_filter": anchor_filter_debug,
+            "question_constraint_target_ids": [candidate.id_or_mid for candidate in interested_node_candidates],
         }
         return ResolvedSubQuestion(
             id=sub_question.id,
             question=sub_question.question,
             topic_entity_candidates=topic_entity_candidates,
-            interested_node_candidates=[],
+            interested_node_candidates=interested_node_candidates,
             relation_candidates=[],
             seed_node_ids=seed_node_ids,
+            constraint_target_ids=self._deduplicate_strings(
+                [candidate.id_or_mid for candidate in interested_node_candidates]
+            ),
             relation_ids=[],
             selected_relation_ids=[],
             expected_answer_type=sub_question.expected_answer_type,
@@ -4010,10 +5075,16 @@ class KGQAPipeline:
                 "entity_id": entity_id,
                 "label": str(graph_api.get_entity_display_name(entity_id) or entity_id),
                 "source_sub_question_id": dependency_id,
-                "source_answer": resolved_sub_answers.get(dependency_id, {}).get("answer", ""),
+                "source_answer": self._grounding_from_payload(
+                    resolved_sub_answers.get(dependency_id, {})
+                ).primary_answer_text
+                or resolved_sub_answers.get(dependency_id, {}).get("answer", ""),
             }
             for dependency_id in sub_question.depends_on
-            for entity_id in resolved_sub_answers.get(dependency_id, {}).get("entity_ids", [])
+            for entity_id in self._dependency_payload_seed_entity_ids(
+                payload=resolved_sub_answers.get(dependency_id, {}),
+                graph_api=graph_api,
+            )
             if entity_id in dependency_seed_ids
         ]
         if len(candidate_entities) <= 1:
@@ -4022,8 +5093,14 @@ class KGQAPipeline:
         resolved_dependencies = [
             {
                 "sub_question_id": dependency_id,
-                "answer": resolved_sub_answers.get(dependency_id, {}).get("answer", ""),
-                "entity_ids": resolved_sub_answers.get(dependency_id, {}).get("entity_ids", []),
+                "answer": (
+                    self._grounding_from_payload(resolved_sub_answers.get(dependency_id, {})).primary_answer_text
+                    or resolved_sub_answers.get(dependency_id, {}).get("answer", "")
+                ),
+                "entity_ids": self._dependency_payload_seed_entity_ids(
+                    payload=resolved_sub_answers.get(dependency_id, {}),
+                    graph_api=graph_api,
+                ),
             }
             for dependency_id in sub_question.depends_on
         ]
@@ -4062,7 +5139,7 @@ class KGQAPipeline:
         for item in summaries:
             if not isinstance(item, dict):
                 continue
-            for triple in item.get("key_triples", []):
+            for triple in self._summary_fact_triples(item):
                 if not isinstance(triple, dict):
                     continue
                 relation = str(triple.get("relation") or "").strip()
@@ -4081,7 +5158,33 @@ class KGQAPipeline:
                 for line in item.get("evidence", [])
                 if str(line).strip()
             )
-        return self._deduplicate_strings(evidence_lines)
+        return self._compress_evidence_lines(self._deduplicate_strings(evidence_lines))
+
+    def _compress_evidence_lines(self, evidence_lines: list[str]) -> list[str]:
+        """Prefer one whole CVT bundle line over repeated atomic lines it already subsumes."""
+        deduped = self._deduplicate_strings([str(line).strip() for line in evidence_lines if str(line).strip()])
+        if not deduped:
+            return []
+
+        bundle_heads: set[str] = set()
+        compressed: list[str] = []
+        for line in deduped:
+            if "{" in line and ";" in line:
+                prefix = line.split("{", 1)[0].strip()
+                if ";" in prefix:
+                    bundle_head = prefix.rsplit(";", 1)[-1].strip()
+                    if bundle_head:
+                        bundle_heads.add(bundle_head)
+                compressed.append(line)
+
+        for line in deduped:
+            if line in compressed:
+                continue
+            line_head = line.split("->", 1)[0].strip() if "->" in line else ""
+            if line_head and line_head in bundle_heads:
+                continue
+            compressed.append(line)
+        return compressed
 
     def _rank_dependency_seed_ids_by_provenance(
         self,
@@ -4108,7 +5211,10 @@ class KGQAPipeline:
         ]
         provenance_chunks: list[str] = []
         for payload in dependency_payloads:
-            provenance_chunks.append(str(payload.get("answer") or "").strip())
+            grounding = self._grounding_from_payload(payload)
+            provenance_chunks.append(grounding.primary_answer_text or str(payload.get("answer") or "").strip())
+            provenance_chunks.extend(str(item).strip() for item in grounding.answer_texts if str(item).strip())
+            provenance_chunks.extend(str(item).strip() for item in grounding.literal_values if str(item).strip())
             provenance_chunks.extend(str(item).strip() for item in payload.get("predicted_answers", []) if str(item).strip())
             provenance_chunks.extend(str(item).strip() for item in payload.get("literals", []) if str(item).strip())
             provenance_chunks.extend(str(item).strip() for item in payload.get("evidence_relations", []) if str(item).strip())
@@ -4293,6 +5399,7 @@ class KGQAPipeline:
         self,
         sub_question: SubQuestionSpec,
         step_seed_ids: list[str],
+        constraint_target_ids: list[str],
         relation_ids: list[str],
         graph_api: Any,
         trace: list[SearchTraceStep],
@@ -4324,27 +5431,22 @@ class KGQAPipeline:
         for path in fallback_paths:
             path.source_stage = "external_graphapi_relation_probe"
         annotate_paths_with_relation_matches(fallback_paths, relation_ids)
+        target_id_set = {value for value in constraint_target_ids if value}
+        target_filtered_count = 0
+        if target_id_set:
+            original_count = len(strict_paths) + len(fallback_paths)
+            strict_paths = [
+                path for path in strict_paths
+                if str(path.terminal_node_id or "").strip() in target_id_set
+            ]
+            fallback_paths = [
+                path for path in fallback_paths
+                if str(path.terminal_node_id or "").strip() in target_id_set
+            ]
+            filtered_count = len(strict_paths) + len(fallback_paths)
+            if filtered_count > 0:
+                target_filtered_count = original_count - filtered_count
         merged_paths = self._sort_cwq_candidate_paths(deduplicate_paths(strict_paths + fallback_paths))
-        merged_paths = expand_cvt_bundle_paths(
-            graph=graph_api,
-            paths=merged_paths,
-            subquestion=sub_question.question,
-            expected_answer_type=sub_question.expected_answer_type,
-            relation_hint_names=relation_ids,
-            anchor_mentions=self._deduplicate_strings(
-                [
-                    sub_question.question,
-                    *[relation.name for relation in sub_question.interested_relations if relation.name],
-                    *[
-                        alias
-                        for relation in sub_question.interested_relations
-                        for alias in relation.aliases
-                        if alias
-                    ],
-                    *[node.name for node in sub_question.interested_nodes if node.name],
-                ]
-            ),
-        )
         trace.append(
             SearchTraceStep(
                 stage="local_relation_probe_search",
@@ -4355,11 +5457,85 @@ class KGQAPipeline:
                     f"sub_question_id={sub_question.id} seed_node_ids={step_seed_ids} "
                     f"relation_ids={relation_ids} max_depth={max_depth} "
                     f"one_hop_only={self._graphapi_one_hop_only()} "
-                    f"strict_paths={len(strict_paths)} fallback_paths={len(fallback_paths)}"
+                    f"strict_paths={len(strict_paths)} fallback_paths={len(fallback_paths)} "
+                    f"constraint_target_ids={constraint_target_ids[:5]} target_filtered={target_filtered_count}"
                 ),
             )
         )
         return merged_paths
+
+    def _question_level_cvt_anchor_mentions(
+        self,
+        question: str,
+        question_analysis: QuestionAnalysisResult,
+    ) -> list[str]:
+        """Build compact anchor mentions for question-level CVT normalization."""
+        return self._deduplicate_strings(
+            [
+                question,
+                *list(question_analysis.ordered_topic_entities),
+                *[
+                    entity.name
+                    for sub_question in question_analysis.sub_questions
+                    for entity in [*sub_question.topic_entities, *sub_question.local_topic_entities, *sub_question.interested_nodes]
+                    if entity.name
+                ],
+                *[
+                    relation.name
+                    for sub_question in question_analysis.sub_questions
+                    for relation in sub_question.interested_relations
+                    if relation.name
+                ],
+                *[
+                    alias
+                    for sub_question in question_analysis.sub_questions
+                    for relation in sub_question.interested_relations
+                    for alias in relation.aliases
+                    if alias
+                ],
+            ]
+        )
+
+    def _normalize_terminal_cvt_paths(
+        self,
+        *,
+        graph_api: Any,
+        candidate_paths: list[ReasoningPath],
+        subquestion_text: str,
+        expected_answer_type: str,
+        relation_hint_names: list[str],
+        anchor_mentions: list[str],
+        trace: list[SearchTraceStep] | None = None,
+        depth: int | None = None,
+        stage_note: str = "",
+    ) -> list[ReasoningPath]:
+        """Normalize terminal CVT paths into answer-facing bundles before pruning/summarization."""
+        if graph_api is None or not candidate_paths:
+            return candidate_paths
+        normalized_paths = expand_cvt_bundle_paths(
+            graph=graph_api,
+            paths=candidate_paths,
+            subquestion=subquestion_text,
+            expected_answer_type=expected_answer_type,
+            relation_hint_names=relation_hint_names,
+            anchor_mentions=anchor_mentions,
+        )
+        if trace is not None and depth is not None:
+            before_bundle = sum(1 for path in candidate_paths if path.source_stage == CVT_BUNDLE_SOURCE_STAGE)
+            after_bundle = sum(1 for path in normalized_paths if path.source_stage == CVT_BUNDLE_SOURCE_STAGE)
+            trace.append(
+                SearchTraceStep(
+                    stage="terminal_cvt_normalization",
+                    depth=depth,
+                    candidate_count=len(candidate_paths),
+                    pruned_count=len(normalized_paths),
+                    note=(
+                        f"{stage_note} before_bundle_paths={before_bundle} "
+                        f"after_bundle_paths={after_bundle} expanded={max(0, after_bundle - before_bundle)}"
+                    ).strip(),
+                )
+            )
+        return normalized_paths
 
     @staticmethod
     def _normalize_relation_text(text: str) -> str:
@@ -4385,6 +5561,67 @@ class KGQAPipeline:
         for dependency_id in sub_question.depends_on:
             resolved.extend(dependency_seed_ids.get(dependency_id, []))
         return self._deduplicate_strings(resolved)
+
+    def _dependency_payload_seed_entity_ids(
+        self,
+        *,
+        payload: dict[str, Any],
+        graph_api: Any,
+    ) -> list[str]:
+        """Resolve dependency seed ids from canonical grounding first, then legacy payloads."""
+        grounding = self._grounding_from_payload(payload)
+        entity_ids = self._deduplicate_strings(
+            [
+                *([grounding.primary_entity_id] if grounding.primary_entity_id else []),
+                *grounding.entity_ids,
+            ]
+        )
+        if entity_ids:
+            return entity_ids
+        fact_entity_ids = self._deduplicate_strings(
+            [
+                *[
+                    str(item.get("tail_id") or "").strip()
+                    for item in grounding.answer_view_facts
+                    if isinstance(item, dict)
+                    and str(item.get("tail_kind") or "id").strip().lower() == "id"
+                    and str(item.get("tail_id") or "").strip()
+                ],
+                *[
+                    str(item.get("tail_id") or "").strip()
+                    for item in payload.get("answer_view_facts", [])
+                    if isinstance(item, dict)
+                    and str(item.get("tail_kind") or "id").strip().lower() == "id"
+                    and str(item.get("tail_id") or "").strip()
+                ],
+                *[
+                    str(item.get("tail_id") or "").strip()
+                    for item in payload.get("key_triple_facts", [])
+                    if isinstance(item, dict)
+                    and str(item.get("tail_kind") or "id").strip().lower() == "id"
+                    and str(item.get("tail_id") or "").strip()
+                ],
+            ]
+        )
+        if fact_entity_ids:
+            return fact_entity_ids
+        answer_texts = self._deduplicate_strings(
+            [*grounding.answer_texts, *grounding.literal_values]
+        )
+        if not answer_texts:
+            answer_texts = self._deduplicate_strings(
+                [
+                    *[str(item).strip() for item in payload.get("predicted_answers", []) if str(item).strip()],
+                    *[str(item).strip() for item in payload.get("literals", []) if str(item).strip()],
+                    str(payload.get("answer") or "").strip(),
+                ]
+            )
+        if answer_texts and graph_api is not None and hasattr(graph_api, "resolve_entity_mentions"):
+            resolved_ids: list[str] = []
+            for label in answer_texts[:5]:
+                resolved_ids.extend(graph_api.resolve_entity_mentions([label], top_k=3))
+            return self._deduplicate_strings(resolved_ids)
+        return self._deduplicate_strings(payload.get("entity_ids", []))
 
     def _collect_dependency_seed_ids(
         self,
@@ -4423,7 +5660,7 @@ class KGQAPipeline:
         }
 
         for summary in summaries:
-            for triple in summary.get("key_triples", []):
+            for triple in self._summary_fact_triples(summary):
                 if not isinstance(triple, dict):
                     continue
                 head = str(triple.get("head") or "").strip()
@@ -4574,8 +5811,10 @@ class KGQAPipeline:
     ) -> dict[str, Any]:
         """Merge sub-question summaries into one aggregate evidence object."""
         key_triples: list[dict[str, str]] = []
+        key_triple_facts: list[dict[str, str]] = []
         evidence: list[str] = []
         seen_triples: set[tuple[str, str, str]] = set()
+        seen_facts: set[tuple[str, str, str, str]] = set()
         seen_evidence: set[str] = set()
         sub_question_ids: list[str] = []
         answered_sub_question_ids: list[str] = []
@@ -4586,7 +5825,7 @@ class KGQAPipeline:
                 sub_question_ids.append(sub_question_id)
             if sub_question_id and (item.get("key_triples") or item.get("evidence")) and sub_question_id not in answered_sub_question_ids:
                 answered_sub_question_ids.append(sub_question_id)
-            for triple in item.get("key_triples", []):
+            for triple in self._summary_fact_triples(item):
                 if not isinstance(triple, dict):
                     continue
                 triple_key = (
@@ -4604,12 +5843,35 @@ class KGQAPipeline:
                         "tail": triple_key[2],
                     }
                 )
+            for fact in self._summary_fact_facts(item):
+                if not isinstance(fact, dict):
+                    continue
+                fact_key = (
+                    str(fact.get("head_id") or ""),
+                    str(fact.get("relation_id") or ""),
+                    str(fact.get("tail_id") or ""),
+                    str(fact.get("tail_label") or ""),
+                )
+                if fact_key in seen_facts:
+                    continue
+                seen_facts.add(fact_key)
+                key_triple_facts.append(
+                    {
+                        "head_id": fact_key[0],
+                        "head_label": str(fact.get("head_label") or ""),
+                        "relation_id": fact_key[1],
+                        "tail_id": fact_key[2],
+                        "tail_label": fact_key[3],
+                        "tail_kind": str(fact.get("tail_kind") or "id"),
+                    }
+                )
             for line in item.get("evidence", []):
                 evidence_line = str(line).strip()
                 if not evidence_line or evidence_line in seen_evidence:
                     continue
                 seen_evidence.add(evidence_line)
                 evidence.append(evidence_line)
+        evidence = self._compress_evidence_lines(evidence)
 
         return {
             "question": question,
@@ -4618,8 +5880,30 @@ class KGQAPipeline:
             "sub_question_ids": sub_question_ids,
             "answered_sub_question_ids": answered_sub_question_ids,
             "key_triples": key_triples,
+            "key_triple_facts": key_triple_facts,
+            "answer_view_facts": key_triple_facts,
             "evidence": evidence,
         }
+
+    def _summary_fact_triples(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Prefer answer-facing summary triples when available."""
+        triples = item.get("answer_view_triples")
+        if isinstance(triples, list) and triples:
+            return [triple for triple in triples if isinstance(triple, dict)]
+        triples = item.get("key_triples", [])
+        if isinstance(triples, list):
+            return [triple for triple in triples if isinstance(triple, dict)]
+        return []
+
+    def _summary_fact_facts(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Prefer answer-facing summary facts with ids when available."""
+        facts = item.get("answer_view_facts")
+        if isinstance(facts, list) and facts:
+            return [fact for fact in facts if isinstance(fact, dict)]
+        facts = item.get("key_triple_facts", [])
+        if isinstance(facts, list):
+            return [fact for fact in facts if isinstance(fact, dict)]
+        return []
 
     def _prune_paths_for_context(
         self,
@@ -4785,6 +6069,18 @@ class KGQAPipeline:
             llm=self.llm,
             agentic_state=agentic_state,
         )
+        answer_result = self._apply_sufficiency_answer_hints(
+            answer_result,
+            sufficiency,
+        )
+        answer_result.grounding = self._build_final_grounding(
+            graph_api=self.graph_api,
+            question_analysis=question_analysis,
+            summarized_paths=summarized_paths,
+            answer_result=answer_result,
+            source_mode="llm_answer",
+        )
+        self._project_grounding_to_answer_result(answer_result, answer_result.grounding)
         answer_result = self._filter_final_answer_result_by_type(
             graph_api=self.graph_api,
             question_analysis=question_analysis,
@@ -4836,6 +6132,17 @@ class KGQAPipeline:
         agentic_state: AgenticRunState | None = None,
     ) -> tuple[list[ReasoningPath], list[dict], object, bool]:
         """Prune, summarize, and answer over the current candidate path set."""
+        candidate_paths = self._normalize_terminal_cvt_paths(
+            graph_api=self.graph_api,
+            candidate_paths=candidate_paths,
+            subquestion_text=question,
+            expected_answer_type=self._question_expected_answer_type(question_analysis),
+            relation_hint_names=relation_hints,
+            anchor_mentions=self._question_level_cvt_anchor_mentions(question, question_analysis),
+            trace=trace,
+            depth=depth,
+            stage_note="question_level",
+        )
         pruned_paths = self._prune_paths_for_context(
             question=question,
             question_analysis=question_analysis,
@@ -4875,6 +6182,7 @@ class KGQAPipeline:
                 candidate_paths=candidate_paths,
                 summarized_paths=summarized_paths,
                 answer_result=answer_result,
+                sufficiency=None,
                 agentic_state=agentic_state,
                 trace=trace,
                 depth=depth,
@@ -4904,6 +6212,7 @@ class KGQAPipeline:
         sample_id: str | None = None,
         gold_answers: list[str] | None = None,
         predicted_answers: list[str] | None = None,
+        final_grounding: dict[str, Any] | None = None,
         search_trace: list[SearchTraceStep] | None = None,
         alignment_debug: list[dict[str, Any]] | None = None,
     ) -> PipelineResult:
@@ -4925,6 +6234,7 @@ class KGQAPipeline:
             sample_id=sample_id,
             gold_answers=list(gold_answers or []),
             predicted_answers=list(predicted_answers or []),
+            final_grounding=dict(final_grounding or {}),
             search_trace=list(search_trace or []),
             alignment_debug=list(alignment_debug or []),
         )

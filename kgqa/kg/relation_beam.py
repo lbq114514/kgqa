@@ -12,7 +12,7 @@ from kgqa.kg.graph_api import BaseGraphAPI, ExternalGraphNeighbor
 from kgqa.llm.base import BaseLLM
 from kgqa.utils.json_utils import robust_json_parse
 from kgqa.utils.logging import get_logger
-from kgqa.utils.types import ReasoningPath, Triple
+from kgqa.utils.types import ReasoningPath, Triple, TripleFact
 
 LOGGER = get_logger(__name__)
 
@@ -132,6 +132,7 @@ class RelationBeamConfig:
 
 
 CVT_BUNDLE_SOURCE_STAGE = "relation_beam_cvt_bundle"
+CVT_DISPLAY_PLACEHOLDER = "[CVT]"
 _CVT_CONSTRAINT_KEYWORDS = (
     "date",
     "year",
@@ -748,12 +749,71 @@ def _edge_to_triple(edge: ExternalGraphNeighbor, graph: BaseGraphAPI) -> Triple:
     return Triple(head=source_label, relation=edge.triple.relation, tail=target_label)
 
 
+def _edge_to_fact(edge: ExternalGraphNeighbor, graph: BaseGraphAPI) -> TripleFact:
+    """Convert one backend edge to an id-preserving fact."""
+    source_label = graph.get_entity_display_name(edge.source_id)
+    target_is_entity = _is_entity_id(edge.neighbor_id)
+    target_label = graph.get_entity_display_name(edge.neighbor_id) if target_is_entity else edge.neighbor_id
+    if edge.reversed:
+        return TripleFact(
+            head_id=edge.neighbor_id if target_is_entity else "",
+            head_label=target_label,
+            relation_id=edge.triple.relation,
+            tail_id=edge.source_id,
+            tail_label=source_label,
+            tail_kind="id",
+        )
+    return TripleFact(
+        head_id=edge.source_id,
+        head_label=source_label,
+        relation_id=edge.triple.relation,
+        tail_id=edge.neighbor_id if target_is_entity else "",
+        tail_label=target_label,
+        tail_kind="id" if target_is_entity else "literal",
+    )
+
+
+def _evidence_edge_to_fact(edge: EvidenceEdge, graph: BaseGraphAPI) -> TripleFact:
+    """Convert one frontier evidence edge to an id-preserving fact."""
+    source_label = graph.get_entity_display_name(edge.source_id)
+    target_is_entity = _is_entity_id(edge.target_id)
+    target_label = graph.get_entity_display_name(edge.target_id) if target_is_entity else edge.target_id
+    if edge.direction == "forward":
+        return TripleFact(
+            head_id=edge.source_id,
+            head_label=source_label,
+            relation_id=edge.relation,
+            tail_id=edge.target_id if target_is_entity else "",
+            tail_label=target_label,
+            tail_kind="id" if target_is_entity else "literal",
+        )
+    return TripleFact(
+        head_id=edge.target_id if target_is_entity else "",
+        head_label=target_label,
+        relation_id=edge.relation,
+        tail_id=edge.source_id,
+        tail_label=source_label,
+        tail_kind="id",
+    )
+
+
 def _append_unique_node(nodes: list[str], value: str) -> None:
     """Keep bundle nodes readable by avoiding repeated labels."""
     normalized = str(value or "").strip()
     if not normalized or normalized in nodes:
         return
     nodes.append(normalized)
+
+
+def _cvt_display_placeholder(cvt_label: str) -> str:
+    """Render one stable but anonymized placeholder for a specific CVT node."""
+    normalized = str(cvt_label or "").strip()
+    if not normalized:
+        return CVT_DISPLAY_PLACEHOLDER
+    suffix = normalized.split(".")[-1][-4:]
+    if not suffix:
+        return CVT_DISPLAY_PLACEHOLDER
+    return f"[CVT:{suffix}]"
 
 
 def _format_bundle_text(
@@ -764,6 +824,7 @@ def _format_bundle_text(
     graph: BaseGraphAPI,
 ) -> str:
     """Render a CVT bundle as one grouped record instead of repeated arrow segments."""
+    placeholder = _cvt_display_placeholder(cvt_label)
     grouped_values: dict[str, list[str]] = {}
     for triple in bundle_triples:
         relation_name = graph.get_relation_display_name(triple.relation)
@@ -778,8 +839,9 @@ def _format_bundle_text(
         else:
             grouped_parts.append(f"{relation_name}: [{', '.join(values)}]")
     if not grouped_parts:
-        return entry_path.text
-    return f"{entry_path.text} ; {cvt_label} {{{'; '.join(grouped_parts)}}}"
+        return entry_path.text.replace(cvt_label, placeholder)
+    entry_text = entry_path.text.replace(cvt_label, placeholder)
+    return f"{entry_text} ; {placeholder} {{{'; '.join(grouped_parts)}}}"
 
 
 def _build_plain_reasoning_path_from_evidence(
@@ -808,6 +870,7 @@ def _build_plain_reasoning_path_from_evidence(
         )
     nodes: list[str] = []
     triples: list[Triple] = []
+    triple_facts: list[TripleFact] = []
     for index, edge in enumerate(evidence):
         source_label = graph.get_entity_display_name(edge.source_id)
         target_is_entity = _is_entity_id(edge.target_id)
@@ -820,6 +883,7 @@ def _build_plain_reasoning_path_from_evidence(
         else:
             triples.append(Triple(head=target_label, relation=edge.relation, tail=source_label))
             nodes.append(target_label)
+        triple_facts.append(_evidence_edge_to_fact(edge, graph))
     text_parts = [
         f"{triple.head} -> {graph.get_relation_display_name(triple.relation)} -> {triple.tail}"
         for triple in triples
@@ -829,6 +893,7 @@ def _build_plain_reasoning_path_from_evidence(
         nodes=nodes,
         text=" ; ".join(text_parts),
         source_stage="relation_beam",
+        triple_facts=triple_facts,
         pruning_status="preserved",
         matched_relations=[triple.relation for triple in triples],
         path_score=path_score,
@@ -931,7 +996,13 @@ def _expand_cvt_bundle_path(
             continue
         selected_edges.append(item)
         _remember_bundle_edge(item)
-    if len(selected_edges) < 2:
+    expandable_answer_edges = [
+        item
+        for item in answer_edges
+        if _can_keep_bundle_edge(item) or item in selected_edges
+    ]
+    allow_single_answer_bundle = len(expandable_answer_edges) >= 1
+    if len(selected_edges) < 2 and not allow_single_answer_bundle:
         return None
     if not answer_edges and not constraint_edges:
         return None
@@ -946,6 +1017,7 @@ def _expand_cvt_bundle_path(
     )
     cvt_label = graph.get_entity_display_name(cvt_node_id)
     triples = list(entry_path.triples)
+    triple_facts = list(entry_path.triple_facts)
     nodes = list(entry_path.nodes)
     matched_relations = [triple.relation for triple in triples]
     matched_answer_type_hints: list[str] = []
@@ -955,7 +1027,9 @@ def _expand_cvt_bundle_path(
     bundle_triples: list[Triple] = []
     for score, role, edge in selected_edges:
         triple = _edge_to_triple(edge, graph)
+        fact = _edge_to_fact(edge, graph)
         triples.append(triple)
+        triple_facts.append(fact)
         bundle_triples.append(triple)
         _append_unique_node(nodes, cvt_label)
         tail_value = triple.tail if triple.head == cvt_label else triple.head
@@ -988,19 +1062,21 @@ def _expand_cvt_bundle_path(
     if schema_hint:
         bundle_breakdown["bundle_schema_hint"] = 1.0
     LOGGER.info(
-        "Relation beam CVT bundle expanded cvt_node_id=%s schema_hint=%s bundle_relation_count=%d bundle_answer_entity_count=%d answer_terminal_id=%s constraint_relation_ids=%s",
+        "Relation beam CVT bundle expanded cvt_node_id=%s schema_hint=%s bundle_relation_count=%d bundle_answer_entity_count=%d answer_terminal_id=%s constraint_relation_ids=%s single_answer_bundle=%s",
         cvt_node_id,
         schema_hint,
         len(selected_edges),
         len(answer_edges),
         answer_terminal_id,
         [edge.triple.relation for _, role, edge in selected_edges if role == "constraint"][:6],
+        allow_single_answer_bundle,
     )
     return ReasoningPath(
         triples=triples,
         nodes=nodes,
         text=text,
         source_stage=CVT_BUNDLE_SOURCE_STAGE,
+        triple_facts=triple_facts,
         pruning_status="preserved",
         matched_relations=matched_relations,
         path_score=path_score + 0.05,

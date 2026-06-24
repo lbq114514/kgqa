@@ -380,8 +380,16 @@ How to use the context:
 Return only JSON:
 {{
   "sufficient": true,
-  "reason": "..."
+  "reason": "...",
+  "primary_answer": "...",
+  "answer_candidates": ["..."]
 }}
+
+Rules for answer extraction:
+- If sufficient is true, set primary_answer to the single best direct answer supported by the evidence when one exists.
+- answer_candidates should contain only direct answer candidates, not supporting entities, bridge nodes, CVT fillers, dates, countries, or co-participants unless the question explicitly asks for them.
+- For bundle-like evidence with multiple slots, choose the slot that best matches the question target. For example, if the question asks "for what event", prefer the event value rather than medal, country, or teammate names.
+- If sufficient is false, return an empty primary_answer and an empty answer_candidates list.
 """
 
 ANSWERING_PROMPT = """You answer a question using only the provided evidence.

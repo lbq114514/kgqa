@@ -82,8 +82,9 @@ def compact_evidence_bank(
                 "summary_type": item.get("summary_type", ""),
                 "sub_question_id": item.get("sub_question_id", ""),
                 "question_focus": item.get("question_focus", ""),
-                "key_triples": list(item.get("key_triples", []))[:max_triples],
+                "key_triples": list(item.get("answer_view_triples", item.get("key_triples", [])))[:max_triples],
                 "evidence": list(item.get("evidence", []))[:max_evidence_lines],
+                "grounding": dict(item.get("grounding", {})) if isinstance(item.get("grounding", {}), dict) else {},
             }
         )
     return compact_items
@@ -119,6 +120,7 @@ def compact_agentic_state(
                 "sub_answer": step.sub_answer,
                 "sub_answer_entities": list(step.sub_answer_entities[:5]),
                 "sub_answer_literals": list(step.sub_answer_literals[:5]),
+                "sub_answer_grounding": dict(step.sub_answer_grounding),
                 "status": step.status,
                 "attempt_count": int(step.attempt_count),
                 "depends_on_step_ids": list(step.depends_on_step_ids[:5]),
