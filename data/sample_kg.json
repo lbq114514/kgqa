@@ -1,0 +1,32 @@
+[
+  {
+    "head": "Nijmegen",
+    "relation": "served_by_airport",
+    "tail": "Weeze Airport"
+  },
+  {
+    "head": "Weeze Airport",
+    "relation": "located_in",
+    "tail": "Germany"
+  },
+  {
+    "head": "Germany",
+    "relation": "borders",
+    "tail": "France"
+  },
+  {
+    "head": "France",
+    "relation": "located_in",
+    "tail": "Europe"
+  },
+  {
+    "head": "Nijmegen",
+    "relation": "located_in",
+    "tail": "Netherlands"
+  },
+  {
+    "head": "Netherlands",
+    "relation": "borders",
+    "tail": "Germany"
+  }
+]

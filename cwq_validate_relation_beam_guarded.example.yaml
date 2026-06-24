@@ -1,0 +1,102 @@
+llm:
+  provider: vllm
+  model: google/gemma-4-31b-it
+  base_url: http://localhost:8000/v1
+  api_key: EMPTY
+  temperature: 0
+  max_tokens: 1024
+
+embedding:
+  model: sentence-transformers/all-MiniLM-L6-v2
+
+search:
+  dmax: 3
+  w1: 30
+  wmax: 10
+  max_expand_steps: 2
+  max_paths_per_pair: 20
+
+agentic:
+  enabled: true
+  max_loops: 10
+  max_carryover_entities: 5
+  max_carryover_text_values: 5
+  local_relation_probe_top_k: 2
+  local_relation_probe:
+    preserve_beam_when_available: true
+    allow_supplemental_non_beam_relations: true
+
+pruning:
+  compact_precise_path_prompt: false
+
+graphapi:
+  enabled: true
+  backend: sqlite
+  db_path: /path/to/freebase_processed.sqlite
+  one_hop_only: true
+  augment_stages:
+    - supplement
+    - node_expand
+  neighbor_limit: 0
+  relation_bias_top_k: 5
+  local_relation_candidate_limit: 200
+  cwq_max_paths: 50
+  cwq_max_nodes: 50
+
+retrieval:
+  backend: indexed_sqlite
+  index_dir: /path/to/runtime_index
+  entity_candidate_top_k: 20
+  entity_candidate_typed_top_k: 120
+  entity_candidate_selected_top_k: 5
+  subquestion_anchor_filtering:
+    enabled: true
+    max_start_nodes: 2
+    filter_dependency_seeds: false
+    use_llm: true
+  ranking:
+    mode: non_llm
+  beam:
+    width: 0
+  search:
+    default_strategy: hybrid
+    max_expansions: 2000
+    max_paths: 0
+    literal_policy: stop
+    high_degree_policy: penalize
+    subquestion_explorer: relation_beam
+
+kg:
+  path: data/sample_kg.json
+
+demo:
+  question_path: data/sample_questions.json
+
+datasets:
+  webqsp:
+    validation_path: /path/to/webqsp/validation.jsonl
+    default_split: validation
+    use_q_entities_for_topic_entities: false
+    external_graph_only: true
+  cwq:
+    test_path: /path/to/cwq/test_simple.json
+    default_split: test
+
+evaluation:
+  output_dir: outputs/cwq_validate_relation_beam_guarded
+  sample_output_dir: sample_predictions
+  qa_concurrency: 6
+
+answering:
+  best_effort:
+    enabled: true
+
+answer_filtering:
+  type_filtering:
+    enabled: true
+    filter_subquestion_candidates: true
+    filter_final_candidates: true
+    allow_soft_type_pass_through: true
+
+logging:
+  level: INFO
