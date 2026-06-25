@@ -2,9 +2,105 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from kgqa.utils.types import AgenticRunState, QuestionAnalysisResult, ReasoningPath
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_text(text: Any) -> str:
+    return _WHITESPACE_RE.sub(" ", str(text or "")).strip()
+
+
+def _shorten_text(text: Any, max_chars: int = 120) -> str:
+    normalized = _normalize_text(text)
+    if len(normalized) <= max_chars:
+        return normalized
+    head_budget = max(16, (max_chars - 3) // 2)
+    tail_budget = max(12, max_chars - 3 - head_budget)
+    return f"{normalized[:head_budget]}...{normalized[-tail_budget:]}"
+
+
+def _compact_relation_name(relation: Any, max_segments: int = 3) -> str:
+    text = _normalize_text(relation)
+    if not text or "." not in text:
+        return text
+    segments = [segment for segment in text.split(".") if segment]
+    if len(segments) == 1:
+        return segments[0]
+
+    prefix = segments[0]
+    if len(prefix) > 4:
+        prefix = prefix[:4]
+
+    if len(segments) <= max_segments:
+        suffix = segments[1:]
+    else:
+        suffix = segments[-(max_segments - 1) :]
+    return ".".join([prefix, "..", *suffix])
+
+
+def _compact_evidence_line(line: Any, max_chars: int = 220) -> str:
+    text = _normalize_text(line)
+    if not text:
+        return ""
+    replacements = (
+        (" -> ", " -> "),
+        (" ; ", " | "),
+        (" (reverse) ", " (rev) "),
+    )
+    for source, target in replacements:
+        text = text.replace(source, target)
+    return _shorten_text(text, max_chars=max_chars)
+
+
+def _compact_triple_dict(triple: Any) -> dict[str, str]:
+    if not isinstance(triple, dict):
+        return {}
+    return {
+        "head": _shorten_text(triple.get("head", ""), max_chars=48),
+        "relation": _compact_relation_name(triple.get("relation", "")),
+        "tail": _shorten_text(triple.get("tail", ""), max_chars=72),
+    }
+
+
+def _compact_grounding(grounding: Any) -> dict[str, Any]:
+    if not isinstance(grounding, dict):
+        return {}
+    answer_texts = [_shorten_text(item, max_chars=72) for item in grounding.get("answer_texts", [])[:3]]
+    entity_labels = [_shorten_text(item, max_chars=72) for item in grounding.get("entity_labels", [])[:3]]
+    entity_ids = [str(item).strip() for item in grounding.get("entity_ids", [])[:3] if str(item).strip()]
+    literal_values = [_shorten_text(item, max_chars=72) for item in grounding.get("literal_values", [])[:3]]
+    compacted = {
+        "primary_answer_text": _shorten_text(grounding.get("primary_answer_text", ""), max_chars=96),
+        "primary_entity_id": str(grounding.get("primary_entity_id", "")).strip(),
+        "answer_texts": answer_texts,
+        "entity_labels": entity_labels,
+        "entity_ids": entity_ids,
+        "literal_values": literal_values,
+        "source_mode": _normalize_text(grounding.get("source_mode", "")),
+    }
+    if grounding.get("supporting_relation_ids"):
+        compacted["supporting_relation_ids"] = [
+            _compact_relation_name(item) for item in grounding.get("supporting_relation_ids", [])[:6]
+        ]
+    return {key: value for key, value in compacted.items() if value}
+
+
+def _compact_resolved_sub_answer(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    compacted = {
+        "answer": _shorten_text(payload.get("answer", ""), max_chars=96),
+        "predicted_answers": [_shorten_text(item, max_chars=72) for item in payload.get("predicted_answers", [])[:3]],
+        "entity_ids": [str(item).strip() for item in payload.get("entity_ids", [])[:3] if str(item).strip()],
+        "evidence_relations": [_compact_relation_name(item) for item in payload.get("evidence_relations", [])[:5]],
+        "grounding": _compact_grounding(payload.get("grounding", {})),
+    }
+    return {key: value for key, value in compacted.items() if value}
 
 
 def compact_question_analysis(
@@ -57,7 +153,10 @@ def compact_reasoning_paths(
                     }
                     for triple in path.triples[:triple_limit]
                 ],
-                "matched_relations": list(path.matched_relations[:matched_relation_limit]),
+                "matched_relations": [
+                    _compact_relation_name(relation)
+                    for relation in list(path.matched_relations[:matched_relation_limit])
+                ],
                 "source_stage": path.source_stage,
                 "terminal_node_id": path.terminal_node_id,
                 "terminal_node_kind": path.terminal_node_kind,
@@ -81,10 +180,21 @@ def compact_evidence_bank(
             {
                 "summary_type": item.get("summary_type", ""),
                 "sub_question_id": item.get("sub_question_id", ""),
-                "question_focus": item.get("question_focus", ""),
-                "key_triples": list(item.get("answer_view_triples", item.get("key_triples", [])))[:max_triples],
-                "evidence": list(item.get("evidence", []))[:max_evidence_lines],
-                "grounding": dict(item.get("grounding", {})) if isinstance(item.get("grounding", {}), dict) else {},
+                "question_focus": _shorten_text(item.get("question_focus", ""), max_chars=140),
+                "key_triples": [
+                    _compact_triple_dict(triple)
+                    for triple in list(item.get("answer_view_triples", item.get("key_triples", [])))[:max_triples]
+                    if isinstance(triple, dict)
+                ],
+                "evidence": [
+                    compacted
+                    for compacted in (
+                        _compact_evidence_line(line, max_chars=220)
+                        for line in list(item.get("evidence", []))[:max_evidence_lines]
+                    )
+                    if compacted
+                ],
+                "grounding": _compact_grounding(item.get("grounding", {})),
             }
         )
     return compact_items
@@ -106,7 +216,7 @@ def compact_agentic_state(
         "pending_sub_question_ids": list(agentic_state.pending_sub_question_ids[:5]),
         "failed_sub_question_ids": list(agentic_state.failed_sub_question_ids[:5]),
         "resolved_sub_answers": {
-            key: value
+            key: _compact_resolved_sub_answer(value)
             for key, value in list(agentic_state.resolved_sub_answers.items())[:max_evidence_items]
         },
         "recent_step_history": [
@@ -115,18 +225,20 @@ def compact_agentic_state(
                 "sub_question_id": step.sub_question_id,
                 "sub_question_text": step.sub_question_text,
                 "resolved_entity_ids": list(step.resolved_entity_ids[:5]),
-                "resolved_relation_ids": list(step.resolved_relation_ids[:5]),
+                "resolved_relation_ids": [
+                    _compact_relation_name(item) for item in step.resolved_relation_ids[:5]
+                ],
                 "candidate_answers": list(step.candidate_answers[:5]),
-                "sub_answer": step.sub_answer,
-                "sub_answer_entities": list(step.sub_answer_entities[:5]),
-                "sub_answer_literals": list(step.sub_answer_literals[:5]),
-                "sub_answer_grounding": dict(step.sub_answer_grounding),
+                "sub_answer": _shorten_text(step.sub_answer, max_chars=96),
+                "sub_answer_entities": [_shorten_text(item, max_chars=72) for item in step.sub_answer_entities[:5]],
+                "sub_answer_literals": [_shorten_text(item, max_chars=72) for item in step.sub_answer_literals[:5]],
+                "sub_answer_grounding": _compact_grounding(step.sub_answer_grounding),
                 "status": step.status,
                 "attempt_count": int(step.attempt_count),
                 "depends_on_step_ids": list(step.depends_on_step_ids[:5]),
-                "failure_reason": step.failure_reason,
+                "failure_reason": _shorten_text(step.failure_reason, max_chars=160),
                 "carryover_entities": list(step.carryover_entities[:5]),
-                "carryover_text_values": list(step.carryover_text_values[:5]),
+                "carryover_text_values": [_shorten_text(item, max_chars=72) for item in step.carryover_text_values[:5]],
                 "is_step_resolved": bool(step.is_step_resolved),
                 "summarized_evidence": compact_evidence_bank(
                     step.summarized_evidence,

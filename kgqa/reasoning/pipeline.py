@@ -266,6 +266,15 @@ def _path_matches_debug_keyword(path: "ReasoningPath", keywords: list[str]) -> b
     return any(keyword in haystack for keyword in keywords for haystack in haystacks)
 
 
+@dataclass(frozen=True)
+class ConstraintPlan:
+    """Path-level constraints derived from interested nodes."""
+
+    target_entity_ids: tuple[str, ...] = ()
+    target_texts: tuple[str, ...] = ()
+    relation_markers: tuple[str, ...] = ()
+
+
 @dataclass
 class KGQAPipeline:
     """Orchestrates the full KGQA search, pruning, summarization, and answering flow."""
@@ -1299,11 +1308,7 @@ class KGQAPipeline:
             can_finalize_strict = bool(
                 required_ids and all(sub_question_id in resolved_ids for sub_question_id in required_ids)
             )
-            can_finalize_partial = bool(
-                not can_finalize_strict
-                and run_state.resolved_sub_answers
-                and self._best_effort_answering_enabled()
-            )
+            can_finalize_partial = False
 
             if can_finalize_strict or can_finalize_partial:
                 aggregate_summary = self._aggregate_subquestion_summaries(question, run_state.evidence_bank)
@@ -1360,40 +1365,6 @@ class KGQAPipeline:
                     llm=self.llm,
                     agentic_state=run_state,
                 )
-                final_answer_result = self._apply_sufficiency_answer_hints(
-                    final_answer_result,
-                    sufficiency,
-                )
-                final_answer_result.grounding = self._build_final_grounding(
-                    graph_api=graph_api,
-                    question_analysis=analysis,
-                    summarized_paths=final_summaries,
-                    answer_result=final_answer_result,
-                    source_mode="llm_answer",
-                )
-                self._project_grounding_to_answer_result(final_answer_result, final_answer_result.grounding)
-                final_answer_result = self._filter_final_answer_result_by_type(
-                    graph_api=graph_api,
-                    question_analysis=analysis,
-                    answer_result=final_answer_result,
-                )
-                if not sufficient:
-                    final_answer_result = self._apply_best_effort_answer_selection(
-                        question_analysis=analysis,
-                        pruned_paths=final_pruned_paths,
-                        candidate_paths=all_candidate_paths,
-                        summarized_paths=final_summaries,
-                        answer_result=final_answer_result,
-                        sufficiency=sufficiency,
-                        agentic_state=run_state,
-                        trace=trace,
-                        depth=min(dmax, max(loop_index, 1)),
-                    )
-                    final_answer_result = self._filter_final_answer_result_by_type(
-                        graph_api=graph_api,
-                        question_analysis=analysis,
-                        answer_result=final_answer_result,
-                    )
                 trace.append(
                     SearchTraceStep(
                         stage="question_answering",
@@ -1575,7 +1546,7 @@ class KGQAPipeline:
         entity_ids = self._deduplicate_strings(grounding.entity_ids)
         literals = self._deduplicate_strings(
             [*grounding.answer_texts, *grounding.literal_values]
-        )[: self._agentic_max_carryover_text_values()]
+        )
         answer = grounding.primary_answer_text or (literals[0] if literals else "")
         return entity_ids, literals, answer
 
@@ -1604,6 +1575,67 @@ class KGQAPipeline:
                 ],
             ]
         )
+
+    def _answer_constraint_texts_for_grounding(
+        self,
+        answer_result: AnswerResult,
+        primary_literals: list[str] | None = None,
+    ) -> list[str]:
+        """Return answer-facing texts that downstream grounding must align to."""
+        values = [
+            str(answer_result.answer or "").strip(),
+            *[str(value).strip() for value in getattr(answer_result, "predicted_answers", []) if str(value).strip()],
+            *[str(value).strip() for value in getattr(answer_result, "resolved_literals", []) if str(value).strip()],
+            *[str(value).strip() for value in getattr(answer_result, "resolved_entity_mentions", []) if str(value).strip()],
+            *[str(value).strip() for value in (primary_literals or []) if str(value).strip()],
+        ]
+        return self._sanitize_answer_candidate_texts(
+            [value for value in values if self._is_propagatable_text(value)]
+        )
+
+    def _filter_grounding_pairs_by_answer_texts(
+        self,
+        ordered_pairs: list[tuple[str, str]],
+        answer_constraint_texts: list[str],
+    ) -> list[tuple[str, str]]:
+        """Keep resolved entity candidates whose labels match the sub-answer text."""
+        if not ordered_pairs or not answer_constraint_texts:
+            return ordered_pairs
+        normalized_answers = {
+            self._normalize_relation_text(value)
+            for value in answer_constraint_texts
+            if self._normalize_relation_text(value)
+        }
+        if not normalized_answers:
+            return ordered_pairs
+        filtered = [
+            (entity_id, label)
+            for entity_id, label in ordered_pairs
+            if self._normalize_relation_text(label) in normalized_answers
+        ]
+        return filtered or ordered_pairs
+
+    def _filter_grounding_literals_by_answer_texts(
+        self,
+        values: list[str],
+        answer_constraint_texts: list[str],
+    ) -> list[str]:
+        """Keep scalar grounding values aligned with the sub-answer text."""
+        if not values or not answer_constraint_texts:
+            return values
+        normalized_answers = {
+            self._normalize_relation_text(value)
+            for value in answer_constraint_texts
+            if self._normalize_relation_text(value)
+        }
+        if not normalized_answers:
+            return values
+        filtered = [
+            value
+            for value in values
+            if self._normalize_relation_text(value) in normalized_answers
+        ]
+        return filtered or values
 
     def _grounding_has_answer_payload(
         self,
@@ -2185,6 +2217,10 @@ class KGQAPipeline:
             structured_outputs=structured_outputs,
             primary_literals=primary_literals,
         )
+        answer_constraint_texts = self._answer_constraint_texts_for_grounding(
+            answer_result=answer_result,
+            primary_literals=primary_literals,
+        )
         summary_tail_labels = self._deduplicate_strings(
             [
                 str(triple.get("tail") or "").strip()
@@ -2208,6 +2244,10 @@ class KGQAPipeline:
             candidate_entity_ids=candidate_entity_ids,
             expected_type=sub_question.expected_answer_type,
         )
+        canonical_labels = self._filter_grounding_literals_by_answer_texts(
+            values=canonical_labels,
+            answer_constraint_texts=answer_constraint_texts,
+        )
 
         entity_labels: list[str] = []
         primary_entity_id = ""
@@ -2219,9 +2259,11 @@ class KGQAPipeline:
                 metadata_by_id=metadata_by_id,
                 step_summaries=step_summaries,
             )
-            canonical_entity_ids = [entity_id for entity_id, _label in ordered_pairs][
-                : self._agentic_max_carryover_entities()
-            ]
+            ordered_pairs = self._filter_grounding_pairs_by_answer_texts(
+                ordered_pairs=ordered_pairs,
+                answer_constraint_texts=answer_constraint_texts,
+            )
+            canonical_entity_ids = [entity_id for entity_id, _label in ordered_pairs]
             entity_labels = self._deduplicate_strings(
                 [
                     label
@@ -2255,7 +2297,7 @@ class KGQAPipeline:
 
         answer_texts = self._sanitize_answer_candidate_texts(
             [*entity_labels, *canonical_labels]
-        )[: self._agentic_max_carryover_text_values()]
+        )
         literal_values = self._sanitize_answer_candidate_texts(
             [
                 str(value).strip()
@@ -2267,7 +2309,11 @@ class KGQAPipeline:
                 ]
                 if str(value).strip()
             ]
-        )[: self._agentic_max_carryover_text_values()]
+        )
+        literal_values = self._filter_grounding_literals_by_answer_texts(
+            values=literal_values,
+            answer_constraint_texts=answer_constraint_texts,
+        )
         if entity_labels:
             literal_values = self._deduplicate_strings(
                 [value for value in literal_values if self._normalize_relation_text(value) not in {
@@ -2298,6 +2344,8 @@ class KGQAPipeline:
                 "candidate_fact_labels": list((fact_entity_labels + fact_literal_values)[:8]),
                 "candidate_labels": list(candidate_labels[:8]),
                 "candidate_entity_ids": list(candidate_entity_ids[:8]),
+                "answer_constraint_texts": list(answer_constraint_texts[:8]),
+                "grounding_entity_ids_after_answer_filter": list(canonical_entity_ids[:8]),
                 "used_label_fallback": not bool(fact_entity_ids),
                 "type_filter_stats": dict(type_filter_stats),
             },
@@ -2465,13 +2513,13 @@ class KGQAPipeline:
             for triple in self._summary_fact_triples(item):
                 if not isinstance(triple, dict):
                     continue
-            tail = str(triple.get("tail") or "").strip()
-            if not tail:
-                continue
-            normalized_tail = self._normalize_relation_text(tail)
-            fallback_tail_labels.append(tail)
-            if labels and normalized_tail and normalized_tail in labels:
-                preferred_tail_labels.append(tail)
+                tail = str(triple.get("tail") or "").strip()
+                if not tail:
+                    continue
+                normalized_tail = self._normalize_relation_text(tail)
+                fallback_tail_labels.append(tail)
+                if labels and normalized_tail and normalized_tail in labels:
+                    preferred_tail_labels.append(tail)
         summary_tail_labels = self._deduplicate_strings(preferred_tail_labels or fallback_tail_labels)
         if not summary_tail_labels:
             return []
@@ -2493,294 +2541,6 @@ class KGQAPipeline:
         ]
         return self._deduplicate_strings(typed_ids or candidate_ids)
 
-    def _best_effort_answering_enabled(self) -> bool:
-        """Return whether low-confidence best-effort answer selection is enabled."""
-        answering_cfg = self.config.get("answering", {})
-        best_effort_cfg = answering_cfg.get("best_effort", {})
-        if isinstance(best_effort_cfg, dict):
-            return bool(best_effort_cfg.get("enabled", False))
-        return bool(best_effort_cfg)
-
-    def _is_best_effort_candidate_text(self, value: str) -> bool:
-        """Keep node-like answer text and reject generic failure/explanation text."""
-        if not self._is_propagatable_text(value):
-            return False
-        lowered = str(value).strip().lower()
-        blocked_markers = (
-            "i am sorry",
-            "the provided evidence",
-            "there is no information",
-            "does not contain information",
-            "cannot determine",
-            "unable to determine",
-            "no factual information",
-        )
-        return not any(marker in lowered for marker in blocked_markers)
-
-    def _collect_best_effort_candidates_from_subanswers(
-        self,
-        question_analysis: QuestionAnalysisResult,
-        agentic_state: AgenticRunState | None,
-    ) -> list[str]:
-        """Prefer the latest resolved sub-answer labels from the agentic execution state."""
-        if agentic_state is None or not agentic_state.resolved_sub_answers:
-            return []
-        ordered_ids = [sub_question.id for sub_question in question_analysis.sub_questions]
-        for sub_question_id in reversed(ordered_ids):
-            payload = agentic_state.resolved_sub_answers.get(sub_question_id, {})
-            if not isinstance(payload, dict):
-                continue
-            grounding = self._grounding_from_payload(payload)
-            values = [
-                *[str(value).strip() for value in grounding.answer_texts if str(value).strip()],
-                *[str(value).strip() for value in grounding.literal_values if str(value).strip()],
-                *[str(value).strip() for value in payload.get("predicted_answers", []) if str(value).strip()],
-                *[str(value).strip() for value in payload.get("literals", []) if str(value).strip()],
-                grounding.primary_answer_text or str(payload.get("answer") or "").strip(),
-            ]
-            filtered = [value for value in values if self._is_best_effort_candidate_text(value)]
-            if filtered:
-                return self._deduplicate_strings(filtered)
-        return []
-
-    def _collect_best_effort_candidates_from_paths(
-        self,
-        paths: list[ReasoningPath],
-    ) -> list[str]:
-        """Collect terminal-node labels from highest-scoring paths."""
-        if not paths:
-            return []
-        ranked_paths = sorted(paths, key=lambda path: float(getattr(path, "path_score", 0.0)), reverse=True)
-        labels: list[str] = []
-        for path in ranked_paths:
-            if path.nodes:
-                labels.append(str(path.nodes[-1]).strip())
-            if len(labels) >= 8:
-                break
-        return self._deduplicate_strings([label for label in labels if self._is_best_effort_candidate_text(label)])
-
-    def _collect_best_effort_candidates_from_summaries(
-        self,
-        summarized_paths: list[dict[str, Any]],
-    ) -> list[str]:
-        """Collect answer-like tail labels from summarized evidence."""
-        labels: list[str] = []
-        for item in summarized_paths:
-            if not isinstance(item, dict):
-                continue
-            grounding = item.get("grounding")
-            if isinstance(grounding, dict):
-                labels.extend(
-                    str(value).strip()
-                    for value in grounding.get("answer_texts", [])
-                    if str(value).strip()
-                )
-            for triple in self._summary_fact_triples(item):
-                if not isinstance(triple, dict):
-                    continue
-                tail = str(triple.get("tail") or "").strip()
-                if tail:
-                    labels.append(tail)
-        return self._deduplicate_strings([label for label in labels if self._is_best_effort_candidate_text(label)])
-
-    def _build_final_grounding(
-        self,
-        *,
-        graph_api: Any,
-        question_analysis: QuestionAnalysisResult,
-        summarized_paths: list[dict[str, Any]],
-        answer_result: AnswerResult,
-        source_mode: str,
-    ) -> AnswerGrounding:
-        """Construct canonical final-answer grounding from summaries and answer outputs."""
-        answer_view_triples = self._collect_answer_view_triples(summarized_paths, [])
-        answer_view_facts = self._collect_answer_view_facts(summarized_paths, [])
-        resolved_grounding_entity_ids: list[str] = []
-        for item in summarized_paths:
-            if not isinstance(item, dict):
-                continue
-            resolved = item.get("resolved_sub_answers", {})
-            if not isinstance(resolved, dict):
-                continue
-            for payload in resolved.values():
-                if not isinstance(payload, dict):
-                    continue
-                grounding = self._grounding_from_payload(payload)
-                resolved_grounding_entity_ids.extend(
-                    [
-                        *([grounding.primary_entity_id] if grounding.primary_entity_id else []),
-                        *grounding.entity_ids,
-                    ]
-                )
-                answer_view_facts.extend(
-                    [
-                        {
-                            "head_id": str(fact.get("head_id") or "").strip(),
-                            "head_label": str(fact.get("head_label") or "").strip(),
-                            "relation_id": str(fact.get("relation_id") or "").strip(),
-                            "tail_id": str(fact.get("tail_id") or "").strip(),
-                            "tail_label": str(fact.get("tail_label") or "").strip(),
-                            "tail_kind": str(fact.get("tail_kind") or "id").strip(),
-                        }
-                        for fact in grounding.answer_view_facts
-                        if isinstance(fact, dict)
-                    ]
-        )
-        fact_entity_ids, fact_entity_labels, fact_literal_values = self._candidate_values_from_answer_view_facts(
-            answer_view_facts
-        )
-        fact_entity_ids = self._deduplicate_strings([*resolved_grounding_entity_ids, *fact_entity_ids])
-        llm_labels = self._deduplicate_strings(
-            [
-                str(answer_result.answer or "").strip(),
-                *[
-                    str(value).strip()
-                    for value in answer_result.predicted_answers
-                    if self._is_propagatable_text(str(value).strip())
-                ],
-                *[
-                    str(value).strip()
-                    for value in answer_result.resolved_literals
-                    if self._is_propagatable_text(str(value).strip())
-                ],
-                *[
-                    str(value).strip()
-                    for value in answer_result.resolved_entity_mentions
-                    if self._is_propagatable_text(str(value).strip())
-                ],
-            ]
-        )
-        llm_labels = self._sanitize_answer_candidate_texts(llm_labels)
-        fallback_fact_labels = self._sanitize_answer_candidate_texts(
-            [
-                *fact_entity_labels,
-                *fact_literal_values,
-                *[
-                    str(triple.get("tail") or "").strip()
-                    for triple in answer_view_triples
-                    if self._is_propagatable_text(str(triple.get("tail") or "").strip())
-                ],
-            ]
-        )
-        labels = list(llm_labels or fallback_fact_labels)
-        entity_ids: list[str] = list(fact_entity_ids)
-        if graph_api is not None and hasattr(graph_api, "resolve_entity_mentions"):
-            for label in labels[:10]:
-                entity_ids.extend(graph_api.resolve_entity_mentions([label], top_k=3))
-        entity_ids = self._deduplicate_strings(entity_ids)
-        expected_type = self._question_expected_answer_type(question_analysis)
-        entity_ids, entity_labels, _ = self._resolve_grounding_entity_candidates(
-            graph_api=graph_api,
-            candidate_labels=labels,
-            candidate_entity_ids=entity_ids,
-            expected_type=expected_type,
-        )
-        answer_texts = self._deduplicate_strings(llm_labels or entity_labels or labels)
-        literal_values = self._deduplicate_strings(
-            [label for label in (llm_labels or labels) if self._normalize_relation_text(label) not in {
-                self._normalize_relation_text(entity_label) for entity_label in entity_labels
-            }]
-        )
-        grounding = AnswerGrounding(
-            answer_texts=list(answer_texts),
-            entity_ids=list(entity_ids),
-            entity_labels=list(entity_labels or answer_texts),
-            literal_values=list(literal_values),
-            primary_answer_text=answer_texts[0] if answer_texts else "",
-            primary_entity_id=entity_ids[0] if entity_ids else "",
-            answer_view_triples=list(answer_view_triples),
-            answer_view_facts=list(answer_view_facts),
-            supporting_relation_ids=self._collect_summary_relation_ids(summarized_paths),
-            source_mode=source_mode,
-            confidence="low" if source_mode == "best_effort" else "high",
-            debug={
-                "expected_type": expected_type,
-                "llm_labels": list(llm_labels[:8]),
-                "fallback_fact_labels": list(fallback_fact_labels[:8]),
-                "fact_entity_ids": list(fact_entity_ids[:8]),
-                "label_resolved_entity_ids": list(entity_ids[:8]),
-                "source_mode": source_mode,
-            },
-        )
-        return grounding
-
-    def _apply_best_effort_answer_selection(
-        self,
-        *,
-        question_analysis: QuestionAnalysisResult,
-        pruned_paths: list[ReasoningPath],
-        candidate_paths: list[ReasoningPath],
-        summarized_paths: list[dict[str, Any]],
-        answer_result: AnswerResult,
-        sufficiency: dict[str, Any] | None,
-        agentic_state: AgenticRunState | None,
-        trace: list[SearchTraceStep],
-        depth: int,
-    ) -> AnswerResult:
-        """Inject a low-confidence answer from evidence when strict answering is insufficient."""
-        if not self._best_effort_answering_enabled():
-            return answer_result
-        if answer_result.grounding and answer_result.grounding.answer_texts and self._is_best_effort_candidate_text(answer_result.answer):
-            return answer_result
-        answer_result = self._apply_sufficiency_answer_hints(answer_result, sufficiency)
-        sufficiency_candidates = self._deduplicate_strings(
-            [
-                str(sufficiency.get("primary_answer") or "").strip()
-                if isinstance(sufficiency, dict)
-                else "",
-                *(
-                    [
-                        str(value).strip()
-                        for value in sufficiency.get("answer_candidates", [])
-                        if str(value).strip()
-                    ]
-                    if isinstance(sufficiency, dict)
-                    else []
-                ),
-            ]
-        )
-        sufficiency_candidates = [
-            value for value in sufficiency_candidates if self._is_best_effort_candidate_text(value)
-        ]
-        candidates = self._deduplicate_strings(
-            [
-                *sufficiency_candidates,
-                *self._collect_best_effort_candidates_from_subanswers(question_analysis, agentic_state),
-                *[str(value).strip() for value in answer_result.predicted_answers if str(value).strip()],
-                *[str(value).strip() for value in answer_result.resolved_literals if str(value).strip()],
-                *[str(value).strip() for value in answer_result.resolved_entity_mentions if str(value).strip()],
-                *self._collect_best_effort_candidates_from_paths(pruned_paths),
-                *self._collect_best_effort_candidates_from_paths(candidate_paths),
-                *self._collect_best_effort_candidates_from_summaries(summarized_paths),
-            ]
-        )
-        candidates = [value for value in candidates if self._is_best_effort_candidate_text(value)]
-        if not candidates:
-            return answer_result
-        answer_result.predicted_answers = list(candidates)
-        answer_result.resolved_literals = self._deduplicate_strings(
-            list(answer_result.resolved_literals) + list(candidates[:3])
-        )
-        answer_result.grounding = self._build_final_grounding(
-            graph_api=self.graph_api,
-            question_analysis=question_analysis,
-            summarized_paths=summarized_paths,
-            answer_result=answer_result,
-            source_mode="best_effort",
-        )
-        self._project_grounding_to_answer_result(answer_result, answer_result.grounding)
-        trace.append(
-            SearchTraceStep(
-                stage="best_effort_answering",
-                depth=depth,
-                candidate_count=len(candidate_paths),
-                pruned_count=min(len(candidates), 3),
-                sufficient=False,
-                note=f"selected={candidates[:3]}",
-            )
-        )
-        return answer_result
-
     def _question_expected_answer_type(self, question_analysis: QuestionAnalysisResult) -> str:
         """Approximate the final expected answer type from the last planned sub-question."""
         if not question_analysis.sub_questions:
@@ -2790,51 +2550,6 @@ class KGQAPipeline:
             if expected_type:
                 return expected_type
         return ""
-
-    def _filter_final_answer_result_by_type(
-        self,
-        graph_api: Any,
-        question_analysis: QuestionAnalysisResult,
-        answer_result: AnswerResult,
-    ) -> AnswerResult:
-        """Filter final answer candidates by the inferred whole-question expected type."""
-        if not self._filter_final_candidates_enabled():
-            return answer_result
-        expected_type = self._question_expected_answer_type(question_analysis)
-        if not expected_type:
-            return answer_result
-        grounding = answer_result.grounding or self._build_final_grounding(
-            graph_api=graph_api,
-            question_analysis=question_analysis,
-            summarized_paths=[],
-            answer_result=answer_result,
-            source_mode="llm_answer",
-        )
-        filtered_ids, filtered_labels, _ = self._filter_candidates_by_expected_type(
-            graph_api=graph_api,
-            expected_type=expected_type,
-            entity_ids=grounding.entity_ids,
-            labels=[
-                *grounding.answer_texts,
-                *grounding.entity_labels,
-                *grounding.literal_values,
-            ],
-        )
-        if not filtered_labels:
-            return answer_result
-        grounding.entity_ids = list(filtered_ids)
-        grounding.entity_labels = list(filtered_labels)
-        grounding.answer_texts = list(filtered_labels)
-        grounding.literal_values = self._deduplicate_strings(
-            [value for value in grounding.literal_values if self._normalize_relation_text(value) in {
-                self._normalize_relation_text(label) for label in filtered_labels
-            }]
-        )
-        grounding.primary_answer_text = filtered_labels[0]
-        grounding.primary_entity_id = filtered_ids[0] if filtered_ids else ""
-        answer_result.grounding = grounding
-        self._project_grounding_to_answer_result(answer_result, grounding)
-        return answer_result
 
     def _subquestion_outputs_match_expected_type(
         self,
@@ -3322,12 +3037,6 @@ class KGQAPipeline:
         cfg = self.config.get("answer_filtering", {}).get("type_filtering", {})
         if isinstance(cfg, dict):
             return bool(cfg.get("filter_subquestion_candidates", True))
-        return self._type_filtering_enabled()
-
-    def _filter_final_candidates_enabled(self) -> bool:
-        cfg = self.config.get("answer_filtering", {}).get("type_filtering", {})
-        if isinstance(cfg, dict):
-            return bool(cfg.get("filter_final_candidates", True))
         return self._type_filtering_enabled()
 
     def _allow_soft_type_pass_through(self) -> bool:
@@ -4198,7 +3907,7 @@ class KGQAPipeline:
         """Resolve entity-like specs and keep the best top-k matches for each spec."""
         candidates: list[ResolvedCandidate] = []
         for spec in specs:
-            names = self._build_entity_query_names(spec)
+            names = self._build_entity_query_names(spec, context_text=context_text)
             recall_top_k = (
                 self._sqlite_entity_candidate_typed_recall_top_k()
                 if str(getattr(spec, "expected_type", "") or "").strip()
@@ -4253,14 +3962,101 @@ class KGQAPipeline:
             candidates.extend(ranked)
         return candidates
 
-    def _build_entity_query_names(self, spec: Any) -> list[str]:
+    def _compound_entity_query_names_from_context(
+        self,
+        base_name: str,
+        context_text: str,
+        expected_type: str,
+    ) -> list[str]:
+        """Return explicit context spans such as "Vienna, Austria" for location mentions."""
+        if not base_name or not context_text:
+            return []
+        location_types = {
+            "administrative division",
+            "city",
+            "citytown",
+            "country",
+            "location",
+            "place",
+            "region",
+            "state",
+            "town",
+        }
+        normalized_type = self._normalize_relation_text(expected_type)
+        if not normalized_type or not any(location_type in normalized_type for location_type in location_types):
+            return []
+
+        pattern = re.compile(rf"(?i)(?<!\w){re.escape(base_name)}\s*,\s*([^,;?]+)")
+        stop_tokens = {
+            "and",
+            "are",
+            "for",
+            "from",
+            "has",
+            "have",
+            "in",
+            "is",
+            "of",
+            "or",
+            "that",
+            "the",
+            "to",
+            "was",
+            "were",
+            "what",
+            "where",
+            "which",
+            "who",
+            "with",
+        }
+        spans: list[str] = []
+        for match in pattern.finditer(context_text):
+            raw_qualifier = match.group(1).strip()
+            qualifier_tokens: list[str] = []
+            for token in raw_qualifier.split():
+                cleaned = token.strip(" \t\r\n\"'()[]{}")
+                if not cleaned:
+                    continue
+                if cleaned.lower().strip(".") in stop_tokens:
+                    break
+                qualifier_tokens.append(cleaned)
+                if len(qualifier_tokens) >= 4:
+                    break
+            qualifier = " ".join(qualifier_tokens).strip(" ,")
+            if not qualifier:
+                continue
+            spans.append(f"{base_name}, {qualifier}")
+            spans.append(f"{base_name} {qualifier}")
+        return self._deduplicate_strings(spans)
+
+    def _build_entity_query_names(self, spec: Any, context_text: str = "") -> list[str]:
         """Expand entity queries with lightweight type-aware variants before reranking."""
         base_name = str(getattr(spec, "name", "") or "").strip()
         aliases = [str(value).strip() for value in getattr(spec, "aliases", []) if str(value).strip()]
         expected_type = self._normalize_relation_text(str(getattr(spec, "expected_type", "") or "").strip())
-        names = self._deduplicate_strings([base_name, *aliases])
+        context_names = self._compound_entity_query_names_from_context(
+            base_name=base_name,
+            context_text=context_text,
+            expected_type=expected_type,
+        )
+        names = self._deduplicate_strings([*context_names, base_name, *aliases])
         if not base_name:
             return names
+        typo_variants: list[str] = []
+        if expected_type in {"character", "person"} or "character" in expected_type:
+            tokens = base_name.split()
+            for index, token in enumerate(tokens):
+                cleaned = token.strip()
+                if len(cleaned) < 5:
+                    continue
+                if cleaned.lower().endswith("d"):
+                    variant_tokens = list(tokens)
+                    variant_tokens[index] = cleaned[:-1]
+                    typo_variants.append(" ".join(variant_tokens))
+                if cleaned.lower().endswith("nd"):
+                    variant_tokens = list(tokens)
+                    variant_tokens[index] = f"{cleaned[:-2]}n"
+                    typo_variants.append(" ".join(variant_tokens))
 
         type_query_suffixes = {
             "state": ["state", "us state"],
@@ -4280,15 +4076,17 @@ class KGQAPipeline:
             "book": ["book"],
             "tv series": ["tv series", "television series", "show"],
             "radio station": ["radio station"],
+            "character": ["character", "fictional character"],
         }
         suffixes = type_query_suffixes.get(expected_type, [])
-        expanded: list[str] = list(names)
-        for suffix in suffixes:
-            expanded.append(f"{base_name} {suffix}")
-            expanded.append(f"{suffix} {base_name}")
-            if expected_type in {"state", "country", "nation", "city"}:
-                expanded.append(f"{base_name} {suffix} of")
-                expanded.append(f"{suffix} of {base_name}")
+        expanded: list[str] = self._deduplicate_strings([*names, *typo_variants])
+        for query_name in [base_name, *typo_variants]:
+            for suffix in suffixes:
+                expanded.append(f"{query_name} {suffix}")
+                expanded.append(f"{suffix} {query_name}")
+                if expected_type in {"state", "country", "nation", "city"}:
+                    expanded.append(f"{query_name} {suffix} of")
+                    expanded.append(f"{suffix} of {query_name}")
         return self._deduplicate_strings(expanded)
 
     def _subquestion_anchor_filter_enabled(self) -> bool:
@@ -4779,6 +4577,7 @@ class KGQAPipeline:
             for item in [relation.name, *relation.aliases]
         )
         question_text = self._normalize_relation_text(sub_question.question)
+        team_championship_context = self._is_team_championship_relation_context(sub_question)
         direction_hints = {
             self._normalize_relation_text(relation.direction)
             for relation in sub_question.interested_relations
@@ -4814,6 +4613,11 @@ class KGQAPipeline:
                 score += 8.0
             if "country" in expected_type and any(token in relation_text for token in ("country", "containedby", "parent")):
                 score += 8.0
+            if team_championship_context:
+                if candidate.id_or_mid == "sports.sports_team.championships":
+                    score += 30.0
+                elif candidate.id_or_mid.startswith("award."):
+                    score -= 8.0
             scored_rows.append((score, candidate))
 
         scored_rows.sort(key=lambda item: (-item[0], item[1].id_or_mid))
@@ -4840,6 +4644,57 @@ class KGQAPipeline:
             "ranked_candidates": debug_rows,
             "selected_relation_ids": self._deduplicate_strings(selected),
         }
+
+    def _is_team_championship_relation_context(self, sub_question: SubQuestionSpec) -> bool:
+        """Return whether relation selection is asking for a team's championships."""
+        text = self._normalize_relation_text(
+            " ".join(
+                [
+                    sub_question.question,
+                    sub_question.expected_answer_type,
+                    *[relation.name for relation in sub_question.interested_relations if relation.name],
+                    *[
+                        alias
+                        for relation in sub_question.interested_relations
+                        for alias in relation.aliases
+                        if alias
+                    ],
+                    *[relation.description for relation in sub_question.interested_relations if relation.description],
+                    *[node.name for node in sub_question.interested_nodes if node.name],
+                    *list(sub_question.downstream_filters),
+                ]
+            )
+        )
+        has_team_context = any(
+            token in text
+            for token in (
+                "team",
+                "basketball",
+                "baseball",
+                "football",
+                "hockey",
+                "soccer",
+                "nba",
+                "nfl",
+                "mlb",
+                "nhl",
+            )
+        )
+        has_championship_context = any(
+            token in text
+            for token in (
+                "championship",
+                "championships",
+                "champion",
+                "won",
+                "win",
+                "wins",
+                "world series",
+                "nba finals",
+                "finals",
+            )
+        )
+        return has_team_context and has_championship_context
 
     def _rerank_candidate_paths_with_local_hints(
         self,
@@ -4870,6 +4725,7 @@ class KGQAPipeline:
             + [entity.name for entity in self._effective_sub_question_topics(sub_question) if entity.name]
         )
         expected_type_terms = self._deduplicate_strings([sub_question.expected_answer_type])
+        constraint_plan = self._constraint_plan_for_subquestion(sub_question)
 
         scored_paths: list[tuple[float, ReasoningPath]] = []
         for path in candidate_paths:
@@ -4893,6 +4749,8 @@ class KGQAPipeline:
             score += 4.0 * max(
                 [self._token_overlap_ratio(term, terminal_text) for term in expected_type_terms] or [0.0]
             )
+            if self._path_matches_constraint_plan(path, constraint_plan):
+                score += 8.0
             path.path_score = score
             scored_paths.append((score, path))
 
@@ -4911,6 +4769,88 @@ class KGQAPipeline:
             )
         )
         return reranked
+
+    def _constraint_plan_for_subquestion(
+        self,
+        sub_question: SubQuestionSpec,
+        constraint_target_ids: list[str] | None = None,
+    ) -> ConstraintPlan:
+        """Build reusable path constraints from interested nodes and resolved ids."""
+        target_texts = self._deduplicate_strings(
+            [
+                node.name
+                for node in sub_question.interested_nodes
+                if node.name
+            ]
+        )
+        expected_types = {
+            self._normalize_relation_text(node.expected_type)
+            for node in sub_question.interested_nodes
+            if node.expected_type
+        }
+        marker_map = {
+            "character": ("character", "role", "performance", "cast", "portray"),
+            "person": ("person", "people", "actor", "cast", "performer"),
+            "team": ("team", "roster", "franchise"),
+            "sports team": ("team", "roster", "franchise"),
+            "country": ("country", "location", "containedby", "nation"),
+            "location": ("location", "containedby", "contains", "place"),
+            "government": ("government", "office", "position"),
+            "government position": ("government", "office", "position"),
+        }
+        markers: list[str] = []
+        for expected_type in expected_types:
+            markers.extend(marker_map.get(expected_type, ()))
+            if expected_type:
+                markers.append(expected_type)
+        for hint in sub_question.interested_relations:
+            markers.append(hint.name)
+            markers.extend(hint.aliases)
+        return ConstraintPlan(
+            target_entity_ids=tuple(self._deduplicate_strings(list(constraint_target_ids or []))),
+            target_texts=tuple(target_texts),
+            relation_markers=tuple(self._deduplicate_strings(markers)),
+        )
+
+    def _path_matches_constraint_plan(self, path: ReasoningPath, plan: ConstraintPlan) -> bool:
+        if not plan.target_entity_ids and not plan.target_texts:
+            return True
+        target_id_set = set(plan.target_entity_ids)
+        if target_id_set:
+            if str(path.terminal_node_id or "").strip() in target_id_set:
+                return True
+            for fact in path.triple_facts:
+                if str(fact.head_id or "").strip() in target_id_set:
+                    return True
+                if str(fact.tail_id or "").strip() in target_id_set:
+                    return True
+            for edge_id in path.edge_ids:
+                if any(target_id in str(edge_id) for target_id in target_id_set):
+                    return True
+        if plan.target_texts:
+            path_text = self._normalize_relation_text(
+                " ".join(
+                    [
+                        path.text,
+                        *path.nodes,
+                        *[
+                            " ".join([triple.head, triple.relation, triple.tail])
+                            for triple in path.triples
+                        ],
+                    ]
+                )
+            )
+            if any(self._token_overlap_ratio(term, path_text) >= 0.5 for term in plan.target_texts):
+                return True
+        return False
+
+    def _constraint_relation_bonus(self, relation_text: str, plan: ConstraintPlan) -> float:
+        if not plan.relation_markers:
+            return 0.0
+        return 8.0 * max(
+            (self._token_overlap_ratio(marker, relation_text) for marker in plan.relation_markers),
+            default=0.0,
+        )
 
     def _select_local_relation_probe_ids(
         self,
@@ -4944,9 +4884,10 @@ class KGQAPipeline:
         if not relation_terms:
             return []
 
+        constraint_plan = self._constraint_plan_for_subquestion(sub_question)
         relation_rows: dict[str, dict[str, Any]] = {}
         per_seed_limit = self._graphapi_local_relation_candidate_limit()
-        for seed_id in step_seed_ids[: self._agentic_max_carryover_entities()]:
+        for seed_id in step_seed_ids:
             for edge in graph_api.get_neighbors(
                 seed_id,
                 include_reverse=True,
@@ -4987,6 +4928,7 @@ class KGQAPipeline:
         scored_rows: list[tuple[float, dict[str, Any]]] = []
         expected_type = self._normalize_relation_text(sub_question.expected_answer_type)
         question_text = self._normalize_relation_text(sub_question.question)
+        team_championship_context = self._is_team_championship_relation_context(sub_question)
         generic_noise_domains = (
             "award.",
             "book.",
@@ -5009,6 +4951,7 @@ class KGQAPipeline:
             )
             score += 8.0 * self._token_overlap_ratio(question_text, relation_text)
             score += 2.0 * self._token_overlap_ratio(question_text, target_text)
+            score += self._constraint_relation_bonus(relation_text, constraint_plan)
             if row["relation_id"] in beam_relation_ids:
                 score += 6.0
             if row["relation_id"].startswith(generic_noise_domains):
@@ -5019,6 +4962,11 @@ class KGQAPipeline:
                 score += 8.0
             if "championship" in relation_text or "championships" in relation_text:
                 score += 6.0
+            if team_championship_context:
+                if row["relation_id"] == "sports.sports_team.championships":
+                    score += 30.0
+                elif row["relation_id"].startswith("award."):
+                    score -= 8.0
             scored_rows.append((score, row))
 
         scored_rows.sort(key=lambda item: (-item[0], item[1]["relation_id"]))
@@ -5031,6 +4979,16 @@ class KGQAPipeline:
             trace=trace,
             depth=depth,
         )
+        if constraint_plan.target_texts or constraint_plan.target_entity_ids:
+            for score, row in scored_rows:
+                relation_text = self._normalize_relation_text(f"{row['relation_id']} {row['display_name']}")
+                if self._constraint_relation_bonus(relation_text, constraint_plan) <= 0.0:
+                    continue
+                relation_id = row["relation_id"]
+                if relation_id not in selected_ids:
+                    selected_ids.append(relation_id)
+                if len(selected_ids) >= max(3, self._agentic_local_relation_probe_top_k() + 1):
+                    break
         trace.append(
             SearchTraceStep(
                 stage="local_relation_probe",
@@ -5055,11 +5013,11 @@ class KGQAPipeline:
         trace: list[SearchTraceStep],
         depth: int,
     ) -> list[str]:
-        """Use the LLM as a supervisor to keep only dependency entities relevant to the current sub-question."""
+        """Order dependency entities for the current sub-question without dropping candidates."""
         dependency_seed_ids = self._deduplicate_strings(dependency_seed_ids)
         if graph_api is None or len(dependency_seed_ids) <= 1 or not sub_question.depends_on:
             return dependency_seed_ids
-        dependency_seed_ids = self._rank_dependency_seed_ids_by_provenance(
+        ranked_dependency_seed_ids = self._rank_dependency_seed_ids_by_provenance(
             sub_question=sub_question,
             dependency_seed_ids=dependency_seed_ids,
             resolved_sub_answers=resolved_sub_answers,
@@ -5067,8 +5025,8 @@ class KGQAPipeline:
             trace=trace,
             depth=depth,
         )
-        if len(dependency_seed_ids) <= 1:
-            return dependency_seed_ids
+        if len(ranked_dependency_seed_ids) <= 1:
+            return ranked_dependency_seed_ids
 
         candidate_entities = [
             {
@@ -5085,10 +5043,10 @@ class KGQAPipeline:
                 payload=resolved_sub_answers.get(dependency_id, {}),
                 graph_api=graph_api,
             )
-            if entity_id in dependency_seed_ids
+            if entity_id in ranked_dependency_seed_ids
         ]
         if len(candidate_entities) <= 1:
-            return dependency_seed_ids
+            return ranked_dependency_seed_ids
 
         resolved_dependencies = [
             {
@@ -5112,22 +5070,26 @@ class KGQAPipeline:
         )
         raw = self.llm.generate(prompt, max_tokens=192)
         parsed = robust_json_parse(raw, fallback={})
-        selected_ids = self._deduplicate_strings(
-            [item for item in parsed.get("selected_entity_ids", []) if item in dependency_seed_ids]
+        preferred_ids = self._deduplicate_strings(
+            [item for item in parsed.get("selected_entity_ids", []) if item in ranked_dependency_seed_ids]
             if isinstance(parsed, dict)
             else []
         )
-        if not selected_ids:
-            selected_ids = dependency_seed_ids
+        selected_ids = self._deduplicate_strings(
+            [
+                *preferred_ids,
+                *[entity_id for entity_id in ranked_dependency_seed_ids if entity_id not in set(preferred_ids)],
+            ]
+        )
         trace.append(
             SearchTraceStep(
                 stage="dependency_entity_filter",
                 depth=depth,
-                candidate_count=len(dependency_seed_ids),
+                candidate_count=len(ranked_dependency_seed_ids),
                 pruned_count=len(selected_ids),
                 note=(
-                    f"sub_question_id={sub_question.id} input_entity_ids={dependency_seed_ids} "
-                    f"selected_entity_ids={selected_ids}"
+                    f"sub_question_id={sub_question.id} input_entity_ids={ranked_dependency_seed_ids} "
+                    f"preferred_entity_ids={preferred_ids} ordered_entity_ids={selected_ids}"
                 ),
             )
         )
@@ -5284,7 +5246,13 @@ class KGQAPipeline:
         scored_ids.sort(key=lambda item: (-item[0], item[1]))
         best_score = scored_ids[0][0]
         keep_threshold = max(best_score * 0.85, best_score - 1.5)
-        selected_ids = [entity_id for score, entity_id, _ in scored_ids if score >= keep_threshold]
+        preferred_ids = [entity_id for score, entity_id, _ in scored_ids if score >= keep_threshold]
+        selected_ids = self._deduplicate_strings(
+            [
+                *preferred_ids,
+                *[entity_id for _score, entity_id, _payload in scored_ids if entity_id not in set(preferred_ids)],
+            ]
+        )
         trace.append(
             SearchTraceStep(
                 stage="dependency_seed_disambiguation",
@@ -5292,7 +5260,8 @@ class KGQAPipeline:
                 candidate_count=len(dependency_seed_ids),
                 pruned_count=len(selected_ids),
                 note=(
-                    f"sub_question_id={sub_question.id} selected_seed_ids={selected_ids} "
+                    f"sub_question_id={sub_question.id} preferred_seed_ids={preferred_ids} "
+                    f"ordered_seed_ids={selected_ids} "
                     f"best_score={round(best_score, 3)} "
                     f"top_candidates={[payload for _, _, payload in scored_ids[:5]]}"
                 ),
@@ -5431,17 +5400,20 @@ class KGQAPipeline:
         for path in fallback_paths:
             path.source_stage = "external_graphapi_relation_probe"
         annotate_paths_with_relation_matches(fallback_paths, relation_ids)
-        target_id_set = {value for value in constraint_target_ids if value}
+        constraint_plan = self._constraint_plan_for_subquestion(
+            sub_question=sub_question,
+            constraint_target_ids=constraint_target_ids,
+        )
         target_filtered_count = 0
-        if target_id_set:
+        if constraint_plan.target_entity_ids or constraint_plan.target_texts:
             original_count = len(strict_paths) + len(fallback_paths)
             strict_paths = [
                 path for path in strict_paths
-                if str(path.terminal_node_id or "").strip() in target_id_set
+                if self._path_matches_constraint_plan(path, constraint_plan)
             ]
             fallback_paths = [
                 path for path in fallback_paths
-                if str(path.terminal_node_id or "").strip() in target_id_set
+                if self._path_matches_constraint_plan(path, constraint_plan)
             ]
             filtered_count = len(strict_paths) + len(fallback_paths)
             if filtered_count > 0:
@@ -5881,7 +5853,7 @@ class KGQAPipeline:
             "answered_sub_question_ids": answered_sub_question_ids,
             "key_triples": key_triples,
             "key_triple_facts": key_triple_facts,
-            "answer_view_facts": key_triple_facts,
+            "answer_view_facts": [],
             "evidence": evidence,
         }
 
@@ -6069,23 +6041,6 @@ class KGQAPipeline:
             llm=self.llm,
             agentic_state=agentic_state,
         )
-        answer_result = self._apply_sufficiency_answer_hints(
-            answer_result,
-            sufficiency,
-        )
-        answer_result.grounding = self._build_final_grounding(
-            graph_api=self.graph_api,
-            question_analysis=question_analysis,
-            summarized_paths=summarized_paths,
-            answer_result=answer_result,
-            source_mode="llm_answer",
-        )
-        self._project_grounding_to_answer_result(answer_result, answer_result.grounding)
-        answer_result = self._filter_final_answer_result_by_type(
-            graph_api=self.graph_api,
-            question_analysis=question_analysis,
-            answer_result=answer_result,
-        )
         note = str(sufficiency.get("reason", ""))
         aggregate_summary = next(
             (
@@ -6175,23 +6130,6 @@ class KGQAPipeline:
             exploration_hints=exploration_hints,
             agentic_state=agentic_state,
         )
-        if not sufficient:
-            answer_result = self._apply_best_effort_answer_selection(
-                question_analysis=question_analysis,
-                pruned_paths=pruned_paths,
-                candidate_paths=candidate_paths,
-                summarized_paths=summarized_paths,
-                answer_result=answer_result,
-                sufficiency=None,
-                agentic_state=agentic_state,
-                trace=trace,
-                depth=depth,
-            )
-            answer_result = self._filter_final_answer_result_by_type(
-                graph_api=self.graph_api,
-                question_analysis=question_analysis,
-                answer_result=answer_result,
-            )
         return pruned_paths, summarized_paths, answer_result, sufficient
 
     def _build_pipeline_result(
@@ -6349,6 +6287,7 @@ class KGQAPipeline:
         """Build the optional relation-beam configuration from runtime config."""
         retrieval_cfg = self.config.get("retrieval", {})
         beam_cfg = retrieval_cfg.get("relation_beam", {})
+        rerank_cfg = beam_cfg.get("sql_candidate_rerank", {})
         return RelationBeamConfig(
             max_hops=max(1, int(beam_cfg.get("max_hops", 3))),
             beam_width=max(1, int(beam_cfg.get("beam_width", 6))),
@@ -6360,6 +6299,10 @@ class KGQAPipeline:
             answer_threshold=float(beam_cfg.get("answer_threshold", 0.82)),
             continue_threshold=float(beam_cfg.get("continue_threshold", 0.45)),
             llm_relation_batch_size=max(1, int(beam_cfg.get("llm_relation_batch_size", 100))),
+            sql_candidate_rerank_enabled=bool(rerank_cfg.get("enabled", True)),
+            sql_candidate_rerank_overfetch_factor=max(1, int(rerank_cfg.get("overfetch_factor", 3))),
+            sql_candidate_rerank_max_overfetch=max(1, int(rerank_cfg.get("max_overfetch", 200))),
+            sql_candidate_rerank_min_candidates=max(1, int(rerank_cfg.get("min_candidates_for_rerank", 50))),
         )
 
     def _retrieval_beam_width(self) -> int:

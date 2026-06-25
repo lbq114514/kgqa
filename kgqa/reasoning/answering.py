@@ -15,6 +15,7 @@ from kgqa.reasoning.prompt_context import (
 )
 from kgqa.utils.json_utils import robust_json_parse
 from kgqa.utils.logging import get_logger
+from kgqa.utils.text import normalize_text
 from kgqa.utils.types import AgenticRunState, AnswerResult, ExplorationHints, QuestionAnalysisResult, SubQuestionSpec
 
 LOGGER = get_logger(__name__)
@@ -35,6 +36,26 @@ def _is_failure_like_answer(value: str) -> bool:
         "no evidence",
     )
     return any(marker in normalized for marker in blocked_markers)
+
+
+def _compact_json(value: Any) -> str:
+    """Serialize prompt payloads without pretty-print whitespace."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _answers_from_json_output(answer_field: Any) -> list[str]:
+    """Convert an answer JSON field to display strings without lowercasing them."""
+    raw_values = answer_field if isinstance(answer_field, list) else [answer_field]
+    answers: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        text = str(value).strip()
+        normalized = normalize_text(text)
+        if not text or not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        answers.append(text)
+    return answers
 
 
 def _build_answering_context(
@@ -68,7 +89,7 @@ def _build_answering_context(
 def _normalize_answer_result(parsed: dict[str, Any]) -> AnswerResult:
     """Normalize parsed answering JSON into a stable AnswerResult."""
     raw_predicted_answers = parsed.get("predicted_answers", [])
-    predicted_answers = answers_from_llm_output(raw_predicted_answers)
+    predicted_answers = _answers_from_json_output(raw_predicted_answers)
 
     raw_answer = parsed.get("answer", "insufficient")
     if isinstance(raw_answer, list):
@@ -78,9 +99,9 @@ def _normalize_answer_result(parsed: dict[str, Any]) -> AnswerResult:
 
     if not predicted_answers:
         if isinstance(raw_answer, list):
-            predicted_answers = answers_from_llm_output(raw_answer)
+            predicted_answers = _answers_from_json_output(raw_answer)
         else:
-            predicted_answers = answers_from_llm_output(answer)
+            predicted_answers = _answers_from_json_output(answer)
 
     predicted_answers = [item for item in predicted_answers if not _is_failure_like_answer(item)]
 
@@ -169,12 +190,18 @@ def check_sufficiency(
     compact_paths = compact_summarized_paths(summarized_paths)
     prompt = SUFFICIENCY_PROMPT.format(
         question=question,
-        topic_entities=json.dumps(context["topic_entities"], ensure_ascii=False),
-        task_analysis=json.dumps(context["task_analysis"], ensure_ascii=False, indent=2),
-        agentic_context=json.dumps(context["agentic_context"], ensure_ascii=False, indent=2),
-        search_context=json.dumps(context["search_context"], ensure_ascii=False, indent=2),
-        split_questions=json.dumps(split_questions, ensure_ascii=False),
-        summarized_paths=json.dumps(compact_paths, ensure_ascii=False, indent=2),
+        topic_entities=_compact_json(context["topic_entities"]),
+        task_analysis=_compact_json(context["task_analysis"]),
+        agentic_context=_compact_json(context["agentic_context"]),
+        search_context=_compact_json(context["search_context"]),
+        split_questions=_compact_json(split_questions),
+        summarized_paths=_compact_json(compact_paths),
+    )
+    LOGGER.info(
+        "Sufficiency prompt compacted question_chars=%d summarized_items=%d prompt_chars=%d",
+        len(question),
+        len(compact_paths),
+        len(prompt),
     )
     raw = llm.generate(prompt, max_tokens=256)
     parsed = robust_json_parse(
@@ -217,12 +244,18 @@ def generate_answer(
     compact_paths = compact_summarized_paths(summarized_paths)
     prompt = ANSWERING_PROMPT.format(
         question=question,
-        topic_entities=json.dumps(context["topic_entities"], ensure_ascii=False),
-        task_analysis=json.dumps(context["task_analysis"], ensure_ascii=False, indent=2),
-        agentic_context=json.dumps(context["agentic_context"], ensure_ascii=False, indent=2),
-        search_context=json.dumps(context["search_context"], ensure_ascii=False, indent=2),
-        split_questions=json.dumps(split_questions, ensure_ascii=False),
-        summarized_paths=json.dumps(compact_paths, ensure_ascii=False, indent=2),
+        topic_entities=_compact_json(context["topic_entities"]),
+        task_analysis=_compact_json(context["task_analysis"]),
+        agentic_context=_compact_json(context["agentic_context"]),
+        search_context=_compact_json(context["search_context"]),
+        split_questions=_compact_json(split_questions),
+        summarized_paths=_compact_json(compact_paths),
+    )
+    LOGGER.info(
+        "Answer prompt compacted question_chars=%d summarized_items=%d prompt_chars=%d",
+        len(question),
+        len(compact_paths),
+        len(prompt),
     )
     raw = llm.generate(prompt, max_tokens=256)
     parsed = robust_json_parse(

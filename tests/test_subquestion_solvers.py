@@ -122,6 +122,95 @@ class FakeIndexedGraphAPI:
         return list(self._constrained_rows)[:limit]
 
 
+class AggregateGraphAPI:
+    def __init__(self, mode: str = "established") -> None:
+        self.selected_relation_ids: list[str] = []
+        self.mode = mode
+
+    def expand_relation_candidates_for_aggregate(self, seed_ids, expected_answer_type="", include_literals=True):
+        if self.mode == "postgraduates":
+            return [
+                {
+                    "relation_id": "education.educational_institution.total_enrollment",
+                    "relation_name": "total enrollment",
+                    "direction": "forward",
+                    "sample_target_types": [],
+                    "sample_target_names": ["40000"],
+                    "support_ratio": 1.0,
+                    "score": 20.0,
+                },
+                {
+                    "relation_id": "education.university.number_of_postgraduates",
+                    "relation_name": "number of postgraduates",
+                    "direction": "forward",
+                    "sample_target_types": [],
+                    "sample_target_names": ["856"],
+                    "support_ratio": 0.5,
+                    "score": 1.0,
+                },
+            ]
+        return [
+            {
+                "relation_id": "architecture.museum.type_of_museum",
+                "relation_name": "type of museum",
+                "direction": "forward",
+                "sample_target_types": ["architecture.type_of_museum"],
+                "sample_target_names": ["History museum"],
+                "support_ratio": 1.0,
+                "score": 20.0,
+            },
+            {
+                "relation_id": "architecture.museum.established",
+                "relation_name": "established",
+                "direction": "forward",
+                "sample_target_types": [],
+                "sample_target_names": ["1891"],
+                "support_ratio": 0.5,
+                "score": 1.0,
+            },
+        ]
+
+    def rank_entities_by_numeric_attribute(self, source_ids, relation_ids, direction="forward", operation="argmax", limit=100):
+        self.selected_relation_ids = list(relation_ids)
+        if self.mode == "postgraduates":
+            rows = [
+                {
+                    "source_entity_id": "m.purdue",
+                    "source_label": "Purdue University",
+                    "relation_id": "education.university.number_of_postgraduates",
+                    "relation_name": "number of postgraduates",
+                    "value": "856",
+                    "numeric_value": 856.0,
+                },
+                {
+                    "source_entity_id": "m.stanford_gsb",
+                    "source_label": "Stanford Graduate School of Business",
+                    "relation_id": "education.university.number_of_postgraduates",
+                    "relation_name": "number of postgraduates",
+                    "value": "809",
+                    "numeric_value": 809.0,
+                },
+            ]
+            return sorted(rows, key=lambda row: row["numeric_value"], reverse=operation != "argmin")[:limit]
+        rows = [
+            {
+                "source_entity_id": "m.old",
+                "source_label": "Old Museum",
+                "relation_id": "architecture.museum.established",
+                "value": "1800-01-01",
+                "numeric_value": 1800.0,
+            },
+            {
+                "source_entity_id": "m.new",
+                "source_label": "New Museum",
+                "relation_id": "architecture.museum.established",
+                "value": "1891-01-01",
+                "numeric_value": 1891.0,
+            },
+        ]
+        return sorted(rows, key=lambda row: row["numeric_value"], reverse=operation != "argmin")[:limit]
+
+
 def _make_pipeline(monkeypatch) -> KGQAPipeline:
     monkeypatch.setattr("kgqa.kg.entity_linking.get_embedding_model", lambda _: object())
     monkeypatch.setattr("kgqa.reasoning.pruning.get_embedding_model", lambda _: object())
@@ -305,6 +394,7 @@ def test_router_upgrades_lookup_solver_request_to_explore() -> None:
         sub_question=sub_question,
         graph_api=None,
         step_seed_ids=["m.france"],
+        constraint_target_ids=[],
         relation_ids=[],
         resolved_sub_answers={},
         execute_explore=lambda: [],
@@ -321,6 +411,7 @@ def test_router_selects_explore_solver() -> None:
         sub_question=sub_question,
         graph_api=None,
         step_seed_ids=["m.movie"],
+        constraint_target_ids=[],
         relation_ids=[],
         resolved_sub_answers={},
         execute_explore=lambda: [],
@@ -337,6 +428,7 @@ def test_router_selects_constrained_collect_solver() -> None:
         sub_question=sub_question,
         graph_api=FakeIndexedGraphAPI([], {}, {}),
         step_seed_ids=["m.seed"],
+        constraint_target_ids=[],
         relation_ids=["location.country.religions"],
         resolved_sub_answers={},
         execute_explore=lambda: [],
@@ -358,6 +450,7 @@ def test_router_upgrades_lookup_without_stable_seed_to_explore() -> None:
         sub_question=sub_question,
         graph_api=None,
         step_seed_ids=[],
+        constraint_target_ids=[],
         relation_ids=[],
         resolved_sub_answers={},
         execute_explore=lambda: [],
@@ -378,6 +471,7 @@ def test_router_upgrades_verify_without_candidate_to_explore() -> None:
         sub_question=sub_question,
         graph_api=None,
         step_seed_ids=[],
+        constraint_target_ids=[],
         relation_ids=[],
         resolved_sub_answers={},
         execute_explore=lambda: [],
@@ -394,6 +488,7 @@ def test_aggregate_solver_supports_in_memory_argmax() -> None:
             sub_question=SubQuestionSpec(id="sq3", question="Which country has the highest population?", solver_type="aggregate"),
             graph_api=None,
             step_seed_ids=[],
+            constraint_target_ids=[],
             relation_ids=[],
             resolved_sub_answers={
                 "sq2": {
@@ -409,6 +504,79 @@ def test_aggregate_solver_supports_in_memory_argmax() -> None:
 
     assert result.solver_type == "aggregate"
     assert result.primary_entity_ids == ["m.b"]
+    assert result.candidate_paths
+    assert result.candidate_paths[0].source_stage == "sql_aggregate"
+
+
+def test_aggregate_solver_reranks_backend_relations_by_superlative_hint() -> None:
+    solver = AggregateSolver({"aggregate": {"graph_sql": {"selected_relation_top_k": 1}}})
+    graph_api = AggregateGraphAPI()
+    result = solver.run(
+        SubquestionExecutionContext(
+            original_question="Which museum was established latest?",
+            sub_question=SubQuestionSpec(
+                id="sq2",
+                question="Of those museums, which one was established the latest?",
+                solver_type="aggregate",
+                depends_on=["sq1"],
+                interested_relations=[
+                    RelationHintSpec(
+                        name="establishment date",
+                        aliases=["founded", "date of establishment"],
+                        description="the date the museum was established",
+                    )
+                ],
+                expected_answer_type="museum",
+            ),
+            graph_api=graph_api,
+            step_seed_ids=[],
+            constraint_target_ids=[],
+            relation_ids=[],
+            resolved_sub_answers={
+                "sq1": {"entity_ids": ["m.old", "m.new"], "entity_set_role": "candidate_answers"}
+            },
+            execute_explore=lambda: [],
+        )
+    )
+
+    assert result.solver_type == "aggregate"
+    assert graph_api.selected_relation_ids == ["architecture.museum.established"]
+    assert result.primary_entity_ids == ["m.new"]
+    assert result.structured_outputs["set_operation_hint"] == "argmax"
+    assert result.candidate_paths
+    assert result.candidate_paths[0].triple_facts[0].relation_id == "architecture.museum.established"
+
+
+def test_aggregate_solver_prefers_argmin_over_number_of_count() -> None:
+    solver = AggregateSolver({"aggregate": {"graph_sql": {"selected_relation_top_k": 1}}})
+    graph_api = AggregateGraphAPI(mode="postgraduates")
+    result = solver.run(
+        SubquestionExecutionContext(
+            original_question="Which college has the smallest number of postgraduates?",
+            sub_question=SubQuestionSpec(
+                id="sq2",
+                question="Which college has the smallest number of postgraduates?",
+                solver_type="aggregate",
+                depends_on=["sq1"],
+                interested_relations=[
+                    RelationHintSpec(name="number of postgraduates", aliases=["postgraduates"])
+                ],
+                expected_answer_type="university",
+            ),
+            graph_api=graph_api,
+            step_seed_ids=[],
+            relation_ids=[],
+            resolved_sub_answers={
+                "sq1": {"entity_ids": ["m.purdue", "m.stanford_gsb"], "entity_set_role": "candidate_answers"}
+            },
+            execute_explore=lambda: [],
+        )
+    )
+
+    assert result.solver_type == "aggregate"
+    assert result.solver_debug["operation"] == "argmin"
+    assert graph_api.selected_relation_ids == ["education.university.number_of_postgraduates"]
+    assert result.primary_entity_ids == ["m.stanford_gsb"]
 
 
 def test_aggregate_solver_supports_in_memory_intersection() -> None:
@@ -419,6 +587,7 @@ def test_aggregate_solver_supports_in_memory_intersection() -> None:
             sub_question=SubQuestionSpec(id="sq3", question="Which institution is the same?", solver_type="aggregate", depends_on=["sq1", "sq2"]),
             graph_api=None,
             step_seed_ids=[],
+            constraint_target_ids=[],
             relation_ids=[],
             resolved_sub_answers={
                 "sq1": {"entity_ids": ["m.uw", "m.other"], "entity_set_role": "comparison_candidates"},
@@ -689,6 +858,7 @@ def test_aggregate_solver_count() -> None:
             sub_question=SubQuestionSpec(id="sqc", question="How many institutions are there?", solver_type="aggregate"),
             graph_api=None,
             step_seed_ids=[],
+            constraint_target_ids=[],
             relation_ids=[],
             resolved_sub_answers={
                 "sq1": {"entity_ids": ["m.a", "m.b"], "entity_set_role": "comparison_candidates"},
@@ -710,6 +880,7 @@ def test_aggregate_solver_fallback_when_missing_inputs() -> None:
             sub_question=SubQuestionSpec(id="sqf", question="Which item is best?", solver_type="aggregate"),
             graph_api=None,
             step_seed_ids=[],
+            constraint_target_ids=[],
             relation_ids=[],
             resolved_sub_answers={},
             execute_explore=lambda: [],

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
 from kgqa.kg.graph_api import ExternalGraphNeighbor
 from kgqa.kg.relation_beam import (
+    CandidateRerankContext,
     EvidenceEdge,
     FrontierExpansion,
     NodeMetadata,
@@ -24,6 +26,22 @@ _INDEX_DB_NAME = "runtime_index.sqlite"
 _INDEX_BATCH_SIZE = 100_000
 _DEFAULT_PROGRESS_EVERY = 1_000_000
 _SQLITE_PARAM_BATCH = 500
+_TYPE_ALIAS_MAP = {
+    "movie": {"film", "motion picture", "feature film"},
+    "film": {"movie", "motion picture", "feature film"},
+    "actor": {"performer", "cast", "person", "film actor"},
+    "actress": {"performer", "cast", "person", "film actor"},
+    "person": {"people", "human"},
+    "city": {"town", "location", "citytown"},
+    "country": {"nation", "sovereign state"},
+    "language": {"spoken language"},
+    "religion": {"faith", "belief system"},
+    "airport": {"airfield", "aviation facility"},
+    "school": {"university", "college", "educational institution"},
+    "date": {"year", "datetime", "time"},
+    "year": {"date", "datetime", "time"},
+    "museum": {"architecture.museum", "museum"},
+}
 
 
 def _format_progress_message(
@@ -66,6 +84,51 @@ def _set_progress_value(connection: sqlite3.Connection, key: str, value: str | i
         "INSERT OR REPLACE INTO build_progress(key, value) VALUES (?, ?)",
         (key, str(value)),
     )
+
+
+def _rerank_type_aliases(*expected_types: str | None) -> tuple[str, ...]:
+    aliases: set[str] = set()
+    for expected_type in expected_types:
+        normalized = normalize_text(expected_type or "")
+        if not normalized:
+            continue
+        aliases.add(normalized)
+        aliases.update(_TYPE_ALIAS_MAP.get(normalized, set()))
+    for alias in list(aliases):
+        aliases.update(_TYPE_ALIAS_MAP.get(alias, set()))
+    return tuple(sorted(alias for alias in aliases if alias))
+
+
+def _candidate_rerank_has_signal(context: CandidateRerankContext | None) -> bool:
+    if context is None:
+        return False
+    return any(
+        [
+            normalize_text(context.expected_answer_type or ""),
+            normalize_text(context.expected_next_type or ""),
+            context.relation_hint_names,
+            context.relation_hint_ids,
+            context.constraint_terms,
+            context.constraint_target_ids,
+        ]
+    )
+
+
+def _parse_numeric_or_year(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        pass
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
+    if match is None:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
 
 
 def build_indexed_sqlite_runtime_index(
@@ -974,27 +1037,106 @@ class IndexedSQLiteGraphBackend(SQLiteGraphAPI):
         operation: str = "argmax",
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Collect literal numeric attributes and rank them using SQLite ordering."""
-        attribute_rows = self.collect_related_literals(
-            source_ids=source_ids,
-            relation_ids=relation_ids,
-            direction=direction,
-            limit=limit,
-        )
+        """Collect literal numeric attributes and rank them in SQLite where possible."""
+        unique_source_ids = list(dict.fromkeys(node_id for node_id in source_ids if node_id))
+        unique_relation_ids = list(dict.fromkeys(relation_id for relation_id in relation_ids if relation_id))
+        if not unique_source_ids or not unique_relation_ids or direction != "forward":
+            return []
+        effective_limit = max(1, int(limit))
+        connection = self.index_connection or self.connection
+        table_name = "edges" if self.index_connection is not None else "triples"
+        tail_kind_column = self.index_connection is not None or self._has_tail_kind
+        literal_only_clause = "tail_kind = 'literal'" if tail_kind_column else "1=1"
+        order_direction = "ASC" if operation == "argmin" else "DESC"
+        sql_ranked: list[dict[str, Any]] = []
+        fallback_rows: list[dict[str, Any]] = []
+        for source_start in range(0, len(unique_source_ids), _SQLITE_PARAM_BATCH):
+            source_batch = unique_source_ids[source_start : source_start + _SQLITE_PARAM_BATCH]
+            source_placeholders = ", ".join("?" for _ in source_batch)
+            for relation_start in range(0, len(unique_relation_ids), _SQLITE_PARAM_BATCH):
+                relation_batch = unique_relation_ids[relation_start : relation_start + _SQLITE_PARAM_BATCH]
+                relation_placeholders = ", ".join("?" for _ in relation_batch)
+                query = f"""
+                    SELECT
+                        head,
+                        relation,
+                        tail,
+                        CAST(REPLACE(tail, ',', '') AS REAL) AS numeric_value
+                    FROM {table_name}
+                    WHERE head IN ({source_placeholders})
+                      AND relation IN ({relation_placeholders})
+                      AND {literal_only_clause}
+                      AND TRIM(tail) GLOB '[+-][0-9]*'
+                    UNION ALL
+                    SELECT
+                        head,
+                        relation,
+                        tail,
+                        CAST(REPLACE(tail, ',', '') AS REAL) AS numeric_value
+                    FROM {table_name}
+                    WHERE head IN ({source_placeholders})
+                      AND relation IN ({relation_placeholders})
+                      AND {literal_only_clause}
+                      AND TRIM(tail) GLOB '[0-9]*'
+                    ORDER BY numeric_value {order_direction}, head ASC, relation ASC, tail ASC
+                    LIMIT ?
+                """
+                params: list[object] = [
+                    *source_batch,
+                    *relation_batch,
+                    *source_batch,
+                    *relation_batch,
+                    effective_limit,
+                ]
+                for row in connection.execute(query, tuple(params)).fetchall():
+                    numeric_value = row["numeric_value"]
+                    if numeric_value is None:
+                        continue
+                    sql_ranked.append(
+                        {
+                            "source_entity_id": str(row["head"]),
+                            "source_label": self.get_entity_display_name(str(row["head"])),
+                            "relation_id": str(row["relation"]),
+                            "relation_name": self.get_relation_display_name(str(row["relation"])),
+                            "value": str(row["tail"]),
+                            "numeric_value": float(numeric_value),
+                        }
+                    )
+                if len(sql_ranked) >= effective_limit:
+                    break
+            if len(sql_ranked) >= effective_limit:
+                break
+
+        if len(sql_ranked) < effective_limit:
+            fallback_rows = self.collect_related_literals(
+                source_ids=unique_source_ids,
+                relation_ids=unique_relation_ids,
+                direction=direction,
+                limit=max(effective_limit, len(unique_source_ids) * max(1, len(unique_relation_ids))),
+            )
+        seen: set[tuple[str, str, str]] = set()
         parsed_rows: list[dict[str, Any]] = []
-        for row in attribute_rows:
-            value_text = str(row.get("value") or "").strip()
-            try:
-                numeric_value = float(value_text.replace(",", ""))
-            except ValueError:
+        for row in [*sql_ranked, *fallback_rows]:
+            key = (
+                str(row.get("source_entity_id") or ""),
+                str(row.get("relation_id") or ""),
+                str(row.get("value") or ""),
+            )
+            if key in seen:
                 continue
-            parsed_rows.append({**row, "numeric_value": numeric_value})
+            seen.add(key)
+            numeric_value = row.get("numeric_value")
+            if numeric_value is None:
+                numeric_value = _parse_numeric_or_year(str(row.get("value") or ""))
+            if numeric_value is None:
+                continue
+            parsed_rows.append({**row, "numeric_value": float(numeric_value)})
         reverse = operation != "argmin"
         return sorted(
             parsed_rows,
             key=lambda item: (float(item.get("numeric_value", 0.0)), str(item.get("source_entity_id", ""))),
             reverse=reverse,
-        )[: max(1, int(limit))]
+        )[:effective_limit]
 
     def expand_relation_candidates_for_aggregate(
         self,
@@ -1142,9 +1284,166 @@ class IndexedSQLiteGraphBackend(SQLiteGraphAPI):
                     direction="reverse",
                     support_key="tail",
                     target_key="head",
-                    metadata_cache=metadata_cache,
+                metadata_cache=metadata_cache,
                 )
         return self._finalize_relation_candidates(aggregation, frontier_size=len(unique_node_ids))
+
+    def _has_candidate_relation(
+        self,
+        node_ids: list[str],
+        relation_ids: tuple[str, ...],
+    ) -> set[str]:
+        """Return candidate nodes that have any hinted relation in either direction."""
+        entity_ids = [node_id for node_id in dict.fromkeys(node_ids) if node_id.startswith(("m.", "g."))]
+        relation_ids = tuple(dict.fromkeys(relation_id for relation_id in relation_ids if relation_id))
+        if not entity_ids or not relation_ids:
+            return set()
+        connection = self.index_connection or self.connection
+        table_name = "edges" if self.index_connection is not None else "triples"
+        matched: set[str] = set()
+        for node_start in range(0, len(entity_ids), _SQLITE_PARAM_BATCH):
+            node_batch = entity_ids[node_start : node_start + _SQLITE_PARAM_BATCH]
+            node_placeholders = ", ".join("?" for _ in node_batch)
+            for relation_start in range(0, len(relation_ids), _SQLITE_PARAM_BATCH):
+                relation_batch = relation_ids[relation_start : relation_start + _SQLITE_PARAM_BATCH]
+                relation_placeholders = ", ".join("?" for _ in relation_batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT head AS node_id
+                    FROM {table_name}
+                    WHERE head IN ({node_placeholders}) AND relation IN ({relation_placeholders})
+                    UNION
+                    SELECT tail AS node_id
+                    FROM {table_name}
+                    WHERE tail IN ({node_placeholders}) AND relation IN ({relation_placeholders})
+                    """,
+                    (*node_batch, *relation_batch, *node_batch, *relation_batch),
+                ).fetchall()
+                matched.update(str(row["node_id"]) for row in rows if str(row["node_id"] or ""))
+        return matched
+
+    def _has_candidate_constraint_edge(
+        self,
+        node_ids: list[str],
+        target_ids: tuple[str, ...],
+    ) -> set[str]:
+        """Return candidate nodes connected to any constraint target id."""
+        entity_ids = [node_id for node_id in dict.fromkeys(node_ids) if node_id.startswith(("m.", "g."))]
+        target_ids = tuple(dict.fromkeys(target_id for target_id in target_ids if target_id.startswith(("m.", "g."))))
+        if not entity_ids or not target_ids:
+            return set()
+        connection = self.index_connection or self.connection
+        table_name = "edges" if self.index_connection is not None else "triples"
+        matched: set[str] = set()
+        for node_start in range(0, len(entity_ids), _SQLITE_PARAM_BATCH):
+            node_batch = entity_ids[node_start : node_start + _SQLITE_PARAM_BATCH]
+            node_placeholders = ", ".join("?" for _ in node_batch)
+            for target_start in range(0, len(target_ids), _SQLITE_PARAM_BATCH):
+                target_batch = target_ids[target_start : target_start + _SQLITE_PARAM_BATCH]
+                target_placeholders = ", ".join("?" for _ in target_batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT head AS node_id
+                    FROM {table_name}
+                    WHERE head IN ({node_placeholders}) AND tail IN ({target_placeholders})
+                    UNION
+                    SELECT tail AS node_id
+                    FROM {table_name}
+                    WHERE tail IN ({node_placeholders}) AND head IN ({target_placeholders})
+                    """,
+                    (*node_batch, *target_batch, *node_batch, *target_batch),
+                ).fetchall()
+                matched.update(str(row["node_id"]) for row in rows if str(row["node_id"] or ""))
+        return matched
+
+    def _resolve_rerank_relation_ids(self, context: CandidateRerankContext) -> tuple[str, ...]:
+        relation_ids: list[str] = [
+            relation_id
+            for relation_id in context.relation_hint_ids
+            if "." in relation_id and normalize_text(relation_id)
+        ]
+        unresolved_hints = [
+            hint
+            for hint in context.relation_hint_names
+            if normalize_text(hint) and hint not in relation_ids
+        ]
+        if unresolved_hints and self.index_connection is not None:
+            for hint in unresolved_hints[:12]:
+                rows = self.index_connection.execute(
+                    """
+                    SELECT relation
+                    FROM relation_lookup
+                    WHERE lookup_norm = ?
+                    LIMIT 3
+                    """,
+                    (normalize_text(hint),),
+                ).fetchall()
+                relation_ids.extend(str(row["relation"]) for row in rows if str(row["relation"] or ""))
+        else:
+            for hint in unresolved_hints[:6]:
+                relation_ids.extend(
+                    str(row.get("relation") or "")
+                    for row in self.resolve_relation_candidates([hint], top_k=3)
+                )
+        return tuple(dict.fromkeys(relation_id for relation_id in relation_ids if relation_id))
+
+    def _rerank_expansion_candidates(
+        self,
+        next_nodes: list[str],
+        context: CandidateRerankContext | None,
+    ) -> list[str]:
+        """Soft-rerank expanded frontier candidates using generic type and local-edge signals."""
+        if not next_nodes or not _candidate_rerank_has_signal(context):
+            return next_nodes
+        assert context is not None
+        metadata = self.get_nodes_metadata_batched(next_nodes)
+        type_aliases = _rerank_type_aliases(context.expected_next_type, context.expected_answer_type)
+        constraint_terms = tuple(normalize_text(term) for term in context.constraint_terms if normalize_text(term))
+        relation_ids = self._resolve_rerank_relation_ids(context)
+        relation_matches = self._has_candidate_relation(next_nodes, relation_ids)
+        constraint_edge_matches = self._has_candidate_constraint_edge(next_nodes, context.constraint_target_ids)
+
+        scored: list[tuple[float, int, str]] = []
+        nonzero = False
+        for original_rank, node_id in enumerate(next_nodes):
+            node = metadata.get(node_id)
+            if node is None:
+                scored.append((0.0, original_rank, node_id))
+                continue
+            haystack = normalize_text(" ".join([node.name, *node.types]))
+            score = 0.0
+            if type_aliases:
+                if any(alias and alias in haystack for alias in type_aliases):
+                    score += 8.0
+                elif any(set(alias.split()) & set(haystack.split()) for alias in type_aliases):
+                    score += 2.0
+            if node_id in relation_matches:
+                score += 6.0
+            matched_constraints = [term for term in constraint_terms if term and term in haystack]
+            score += 2.0 * len(matched_constraints)
+            if node_id in constraint_edge_matches:
+                score += 3.0
+            if node.is_probable_cvt:
+                score -= 2.0
+            if node.is_literal and type_aliases and not any(alias in {"date", "year", "datetime", "time"} for alias in type_aliases):
+                score -= 2.0
+            if score != 0.0:
+                nonzero = True
+            scored.append((score, original_rank, node_id))
+        if not nonzero:
+            return next_nodes
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        reranked = [node_id for _, _, node_id in scored]
+        LOGGER.info(
+            "GraphAPI expansion rerank candidates=%d top_before=%s top_after=%s type_aliases=%s relation_hints=%s constraint_terms=%s",
+            len(next_nodes),
+            next_nodes[:5],
+            reranked[:5],
+            type_aliases[:6],
+            relation_ids[:6],
+            constraint_terms[:6],
+        )
+        return reranked
 
     def expand_frontier_by_relation(
         self,
@@ -1154,6 +1453,10 @@ class IndexedSQLiteGraphBackend(SQLiteGraphAPI):
         parent_evidence_paths: dict[str, tuple[EvidenceEdge, ...]] | None = None,
         limit_per_source: int = 8,
         total_limit: int = 100,
+        rerank_context: CandidateRerankContext | None = None,
+        overfetch_factor: int = 3,
+        max_overfetch: int = 200,
+        min_candidates_for_rerank: int = 50,
     ) -> FrontierExpansion:
         """Expand a frontier by one exact relation action while preserving evidence paths."""
         unique_node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
@@ -1164,33 +1467,31 @@ class IndexedSQLiteGraphBackend(SQLiteGraphAPI):
         limit_per_source = max(1, int(limit_per_source))
         effective_total_limit = max(1, int(total_limit))
         parent_evidence_paths = parent_evidence_paths or {}
-        next_nodes: list[str] = []
-        evidence_paths: dict[str, tuple[EvidenceEdge, ...]] = {}
-        edge_count = 0
-        truncated = False
-        if self.index_connection is not None:
-            source_rows = self._query_relation_expansion_rows_batched(
-                source_ids=unique_node_ids,
-                relation=relation,
-                direction=direction,
-                limit_per_source=limit_per_source,
-            )
-            source_totals = {
-                source_id: rows[0]["source_total"] if rows else 0
-                for source_id, rows in source_rows.items()
-            }
-        else:
-            source_rows = {}
-            source_totals = {}
+
+        def load_source_rows(fetch_limit_per_source: int) -> tuple[dict[str, list[sqlite3.Row]], dict[str, int]]:
+            if self.index_connection is not None:
+                batched_rows = self._query_relation_expansion_rows_batched(
+                    source_ids=unique_node_ids,
+                    relation=relation,
+                    direction=direction,
+                    limit_per_source=fetch_limit_per_source,
+                )
+                totals = {
+                    source_id: int(rows[0]["source_total"] or 0) if rows else 0
+                    for source_id, rows in batched_rows.items()
+                }
+                return batched_rows, totals
+            fallback_rows: dict[str, list[sqlite3.Row]] = {}
+            totals = {}
             for source_id in unique_node_ids:
                 rows = self._query_relation_expansion_rows(
                     source_id=source_id,
                     relation=relation,
                     direction=direction,
-                    limit=limit_per_source,
+                    limit=fetch_limit_per_source,
                 )
-                source_rows[source_id] = rows
-                source_totals[source_id] = (
+                fallback_rows[source_id] = rows
+                totals[source_id] = (
                     self._count_relation_expansion_edges(
                         source_id=source_id,
                         relation=relation,
@@ -1199,15 +1500,42 @@ class IndexedSQLiteGraphBackend(SQLiteGraphAPI):
                     if rows
                     else 0
                 )
+            return fallback_rows, totals
+
+        source_rows, source_totals = load_source_rows(limit_per_source)
+        total_available = sum(source_totals.values())
+        initial_has_truncation_risk = (
+            total_available > effective_total_limit
+            or any(total > limit_per_source for total in source_totals.values())
+        )
+        rerank_enabled = (
+            _candidate_rerank_has_signal(rerank_context)
+            and initial_has_truncation_risk
+            and total_available >= max(1, int(min_candidates_for_rerank))
+        )
+        effective_collection_limit = effective_total_limit
+        effective_limit_per_source = limit_per_source
+        if rerank_enabled:
+            factor = max(1, int(overfetch_factor))
+            cap = max(effective_total_limit, int(max_overfetch))
+            effective_collection_limit = min(max(effective_total_limit * factor, effective_total_limit), cap)
+            effective_limit_per_source = min(max(limit_per_source * factor, limit_per_source), cap)
+            if effective_limit_per_source > limit_per_source:
+                source_rows, source_totals = load_source_rows(effective_limit_per_source)
+
+        next_nodes: list[str] = []
+        evidence_paths: dict[str, tuple[EvidenceEdge, ...]] = {}
+        edge_count = 0
+        truncated = False
 
         for source_id in unique_node_ids:
-            if len(next_nodes) >= effective_total_limit:
+            if len(next_nodes) >= effective_collection_limit:
                 truncated = True
                 break
             rows = source_rows.get(source_id, [])
             kept_for_source = 0
             for row in rows:
-                if len(next_nodes) >= effective_total_limit:
+                if len(next_nodes) >= effective_collection_limit:
                     truncated = True
                     break
                 target_id = str(row["tail"] if direction == "forward" else row["head"])
@@ -1227,14 +1555,18 @@ class IndexedSQLiteGraphBackend(SQLiteGraphAPI):
                             target_id=target_id,
                         ),
                     )
-            if kept_for_source >= limit_per_source and source_totals.get(source_id, 0) > limit_per_source:
+            if kept_for_source >= effective_limit_per_source and source_totals.get(source_id, 0) > effective_limit_per_source:
                 truncated = True
-            if len(next_nodes) >= effective_total_limit:
+            if len(next_nodes) >= effective_collection_limit:
                 truncated = True
                 break
+        if rerank_enabled:
+            next_nodes = self._rerank_expansion_candidates(next_nodes, rerank_context)
+        final_nodes = tuple(next_nodes[:effective_total_limit])
+        final_evidence_paths = {node_id: evidence_paths.get(node_id, ()) for node_id in final_nodes}
         return FrontierExpansion(
-            next_nodes=tuple(next_nodes),
-            evidence_paths=evidence_paths,
+            next_nodes=final_nodes,
+            evidence_paths=final_evidence_paths,
             source_node_count=len(unique_node_ids),
             edge_count=edge_count,
             truncated=truncated,

@@ -95,6 +95,20 @@ class FrontierExpansion:
 
 
 @dataclass(frozen=True)
+class CandidateRerankContext:
+    """Optional soft-rerank signals for relation expansion candidates."""
+
+    expected_answer_type: str | None = None
+    expected_next_type: str | None = None
+    relation_hint_names: tuple[str, ...] = ()
+    relation_hint_ids: tuple[str, ...] = ()
+    constraint_terms: tuple[str, ...] = ()
+    constraint_target_ids: tuple[str, ...] = ()
+    question_text: str = ""
+    subquestion: str = ""
+
+
+@dataclass(frozen=True)
 class RelationBeamState:
     """One beam-search state keyed by a relation path and frontier."""
 
@@ -129,6 +143,10 @@ class RelationBeamConfig:
     answer_threshold: float = 0.82
     continue_threshold: float = 0.45
     llm_relation_batch_size: int = 100
+    sql_candidate_rerank_enabled: bool = True
+    sql_candidate_rerank_overfetch_factor: int = 3
+    sql_candidate_rerank_max_overfetch: int = 200
+    sql_candidate_rerank_min_candidates: int = 50
 
 
 CVT_BUNDLE_SOURCE_STAGE = "relation_beam_cvt_bundle"
@@ -1595,6 +1613,85 @@ def build_child_state(
     )
 
 
+def _dedupe_nonempty(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        results.append(text)
+    return tuple(results)
+
+
+def _dependency_constraint_terms(resolved_dependencies: list[dict[str, Any]]) -> tuple[str, ...]:
+    values: list[str] = []
+    for item in resolved_dependencies[:5]:
+        answer = str(item.get("answer") or "").strip()
+        if answer:
+            values.append(answer)
+        for key in ("predicted_answers", "literals"):
+            raw_values = item.get(key, [])
+            if isinstance(raw_values, list):
+                values.extend(str(value) for value in raw_values[:5])
+    return _dedupe_nonempty(values)
+
+
+def _dependency_constraint_ids(resolved_dependencies: list[dict[str, Any]]) -> tuple[str, ...]:
+    values: list[str] = []
+    for item in resolved_dependencies[:5]:
+        raw_values = item.get("entity_ids", [])
+        if isinstance(raw_values, list):
+            values.extend(str(value) for value in raw_values[:5])
+    return _dedupe_nonempty(values)
+
+
+def _candidate_rerank_context_has_signal(context: CandidateRerankContext) -> bool:
+    return any(
+        [
+            str(context.expected_answer_type or "").strip(),
+            str(context.expected_next_type or "").strip(),
+            context.relation_hint_names,
+            context.relation_hint_ids,
+            context.constraint_terms,
+            context.constraint_target_ids,
+        ]
+    )
+
+
+def _build_candidate_rerank_context(
+    *,
+    original_question: str,
+    subquestion: str,
+    expected_answer_type: str | None,
+    action: RelationAction,
+    relation_hint_names: list[str],
+    resolved_dependencies: list[dict[str, Any]],
+    ranked_candidates: list[RelationCandidate],
+) -> CandidateRerankContext | None:
+    hint_ids: list[str] = []
+    hint_names: list[str] = list(relation_hint_names)
+    for candidate in ranked_candidates[:12]:
+        if candidate.relation != action.relation:
+            hint_ids.append(candidate.relation)
+        if candidate.relation_name:
+            hint_names.append(candidate.relation_name)
+    context = CandidateRerankContext(
+        expected_answer_type=expected_answer_type,
+        expected_next_type=action.expected_next_type,
+        relation_hint_names=_dedupe_nonempty(tuple(hint_names)),
+        relation_hint_ids=_dedupe_nonempty(tuple(hint_ids)),
+        constraint_terms=_dependency_constraint_terms(resolved_dependencies),
+        constraint_target_ids=_dependency_constraint_ids(resolved_dependencies),
+        question_text=original_question,
+        subquestion=subquestion,
+    )
+    if not _candidate_rerank_context_has_signal(context):
+        return None
+    return context
+
+
 class RelationTypeBeamSearcher:
     """LLM-guided, relation-oriented beam search over frontier node sets."""
 
@@ -1775,16 +1872,43 @@ class RelationTypeBeamSearcher:
                     ]
                 selected_actions += len(actions)
                 for action in actions[: self.config.relations_per_state]:
+                    rerank_context = (
+                        _build_candidate_rerank_context(
+                            original_question=original_question,
+                            subquestion=subquestion,
+                            expected_answer_type=expected_answer_type,
+                            action=action,
+                            relation_hint_names=relation_hint_names,
+                            resolved_dependencies=resolved_dependencies,
+                            ranked_candidates=ranked_candidates,
+                        )
+                        if self.config.sql_candidate_rerank_enabled
+                        else None
+                    )
                     expand_start = perf_counter()
                     try:
-                        expansion = self.graph.expand_frontier_by_relation(
-                            list(state.frontier_nodes),
-                            relation=action.relation,
-                            direction=action.direction,
-                            parent_evidence_paths=state.evidence_paths,
-                            limit_per_source=self.config.neighbors_per_source,
-                            total_limit=self.config.max_nodes_per_path,
-                        )
+                        try:
+                            expansion = self.graph.expand_frontier_by_relation(
+                                list(state.frontier_nodes),
+                                relation=action.relation,
+                                direction=action.direction,
+                                parent_evidence_paths=state.evidence_paths,
+                                limit_per_source=self.config.neighbors_per_source,
+                                total_limit=self.config.max_nodes_per_path,
+                                rerank_context=rerank_context,
+                                overfetch_factor=self.config.sql_candidate_rerank_overfetch_factor,
+                                max_overfetch=self.config.sql_candidate_rerank_max_overfetch,
+                                min_candidates_for_rerank=self.config.sql_candidate_rerank_min_candidates,
+                            )
+                        except TypeError:
+                            expansion = self.graph.expand_frontier_by_relation(
+                                list(state.frontier_nodes),
+                                relation=action.relation,
+                                direction=action.direction,
+                                parent_evidence_paths=state.evidence_paths,
+                                limit_per_source=self.config.neighbors_per_source,
+                                total_limit=self.config.max_nodes_per_path,
+                            )
                     except AttributeError:
                         continue
                     expand_elapsed = perf_counter() - expand_start

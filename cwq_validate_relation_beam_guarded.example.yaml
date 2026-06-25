@@ -65,6 +65,12 @@ retrieval:
     literal_policy: stop
     high_degree_policy: penalize
     subquestion_explorer: relation_beam
+  relation_beam:
+    sql_candidate_rerank:
+      enabled: true
+      overfetch_factor: 3
+      max_overfetch: 200
+      min_candidates_for_rerank: 50
 
 kg:
   path: data/sample_kg.json
@@ -87,15 +93,10 @@ evaluation:
   sample_output_dir: sample_predictions
   qa_concurrency: 6
 
-answering:
-  best_effort:
-    enabled: true
-
 answer_filtering:
   type_filtering:
     enabled: true
     filter_subquestion_candidates: true
-    filter_final_candidates: true
     allow_soft_type_pass_through: true
 
 logging:

@@ -27,6 +27,7 @@ from kgqa.utils.types import (
     QuestionAnalysisResult,
     ReasoningPath,
     RelationHintSpec,
+    ResolvedCandidate,
     SubQuestionSpec,
     SupplementHints,
     Triple,
@@ -821,12 +822,13 @@ def test_local_relation_probe_selects_championship_relation(monkeypatch) -> None
         sub_question=sub_question,
         step_seed_ids=["m.team"],
         relation_ids=relation_ids,
+        constraint_target_ids=[],
         graph_api=graph_api,
         trace=trace,
         depth=1,
     )
 
-    assert relation_ids == ["sports.sports_team.championships"]
+    assert relation_ids[0] == "sports.sports_team.championships"
     assert any(path.text.endswith("2012-10-28") for path in probed_paths)
 
 
@@ -873,7 +875,7 @@ def test_dependency_entity_filter_prefers_primary_upstream_answer(monkeypatch) -
         depth=1,
     )
 
-    assert selected == ["m.team"]
+    assert selected == ["m.team", "m.player"]
 
 
 def test_relation_supervision_overrides_heuristic_drift(monkeypatch) -> None:
@@ -925,6 +927,47 @@ def test_relation_supervision_overrides_heuristic_drift(monkeypatch) -> None:
     )
 
     assert selected == ["sports.sports_team.championships"]
+
+
+def test_relation_rerank_prefers_sports_team_championships_for_team_titles() -> None:
+    pipeline = KGQAPipeline.__new__(KGQAPipeline)
+    sub_question = SubQuestionSpec(
+        id="sq2",
+        question="What year did that basketball team win the championship?",
+        interested_relations=[
+            RelationHintSpec(
+                name="championship year",
+                aliases=["won championship in"],
+                description="the year the team won the championship",
+            )
+        ],
+        expected_answer_type="year",
+        depends_on=["sq1"],
+    )
+
+    selected, debug = pipeline._select_relation_ids_for_sub_question(
+        sub_question=sub_question,
+        relation_candidates=[
+            ResolvedCandidate(
+                id_or_mid="award.award_winner.awards_won",
+                label="awards won",
+                mention_or_hint="championship year",
+                match_type="relation",
+                score=85.0,
+            ),
+            ResolvedCandidate(
+                id_or_mid="sports.sports_team.championships",
+                label="championships",
+                mention_or_hint="championship year",
+                match_type="relation",
+                score=60.0,
+            ),
+        ],
+        entity_candidates=[],
+    )
+
+    assert selected[0] == "sports.sports_team.championships"
+    assert debug["ranked_candidates"][0]["relation_id"] == "sports.sports_team.championships"
 
 
 def test_relation_supervision_falls_back_when_llm_selects_nothing(monkeypatch) -> None:

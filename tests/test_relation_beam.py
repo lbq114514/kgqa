@@ -14,6 +14,7 @@ import kgqa.retrieval.backend as backend_module
 from kgqa.kg.relation_beam import (
     BaseLLMRelationBeamAdapter,
     CVT_BUNDLE_SOURCE_STAGE,
+    CandidateRerankContext,
     DeterministicMockRelationBeamLLM,
     EvidenceEdge,
     FrontierExpansion,
@@ -54,6 +55,16 @@ def _build_relation_beam_fixture(tmp_path: Path) -> tuple[Path, Path]:
         {"id": "m.person_b", "name": "Person B", "aliases": "", "types": "people.person", "is_cvt": "0"},
         {"id": "m.city_c", "name": "City C", "aliases": "", "types": "location.citytown", "is_cvt": "0"},
         {"id": "m.profession_x", "name": "Lawyer", "aliases": "", "types": "people.profession", "is_cvt": "0"},
+        {"id": "m.attraction_0", "name": "Opera House", "aliases": "", "types": "travel.tourist_attraction", "is_cvt": "0"},
+        {"id": "m.attraction_1", "name": "City Park", "aliases": "", "types": "travel.tourist_attraction", "is_cvt": "0"},
+        {"id": "m.attraction_2", "name": "Central Zoo", "aliases": "", "types": "travel.tourist_attraction", "is_cvt": "0"},
+        {
+            "id": "m.zz_museum",
+            "name": "History Museum",
+            "aliases": "",
+            "types": "architecture.museum|travel.tourist_attraction",
+            "is_cvt": "0",
+        },
     ]
     for index in range(12):
         entity_rows.append(
@@ -111,6 +122,54 @@ def _build_relation_beam_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "head_name": "Person B",
             "relation": "type.object.name",
             "tail": "Person B",
+            "tail_name": "",
+            "tail_kind": "literal",
+        },
+        {
+            "head": "m.city_c",
+            "head_name": "City C",
+            "relation": "travel.travel_destination.tourist_attractions",
+            "tail": "m.attraction_0",
+            "tail_name": "Opera House",
+            "tail_kind": "id",
+        },
+        {
+            "head": "m.city_c",
+            "head_name": "City C",
+            "relation": "travel.travel_destination.tourist_attractions",
+            "tail": "m.attraction_1",
+            "tail_name": "City Park",
+            "tail_kind": "id",
+        },
+        {
+            "head": "m.city_c",
+            "head_name": "City C",
+            "relation": "travel.travel_destination.tourist_attractions",
+            "tail": "m.attraction_2",
+            "tail_name": "Central Zoo",
+            "tail_kind": "id",
+        },
+        {
+            "head": "m.city_c",
+            "head_name": "City C",
+            "relation": "travel.travel_destination.tourist_attractions",
+            "tail": "m.zz_museum",
+            "tail_name": "History Museum",
+            "tail_kind": "id",
+        },
+        {
+            "head": "m.zz_museum",
+            "head_name": "History Museum",
+            "relation": "architecture.museum.established",
+            "tail": "1900",
+            "tail_name": "",
+            "tail_kind": "literal",
+        },
+        {
+            "head": "m.attraction_0",
+            "head_name": "Opera House",
+            "relation": "architecture.museum.established",
+            "tail": "1800",
             "tail_name": "",
             "tail_kind": "literal",
         },
@@ -261,6 +320,95 @@ def test_expand_frontier_by_relation_limits_and_evidence(tmp_path: Path) -> None
                 target_id=first_target,
             ),
         )
+    finally:
+        backend.close()
+
+
+def test_expand_frontier_reranks_typed_candidates_before_truncation(tmp_path: Path) -> None:
+    db_path, index_dir = _build_relation_beam_fixture(tmp_path)
+    backend = IndexedSQLiteGraphBackend(db_path=db_path, index_dir=index_dir, neighbor_limit=20)
+    try:
+        baseline = backend.expand_frontier_by_relation(
+            ["m.city_c"],
+            relation="travel.travel_destination.tourist_attractions",
+            direction="forward",
+            parent_evidence_paths={"m.city_c": ()},
+            limit_per_source=2,
+            total_limit=2,
+        )
+        assert baseline.next_nodes == ("m.attraction_0", "m.attraction_1")
+
+        reranked = backend.expand_frontier_by_relation(
+            ["m.city_c"],
+            relation="travel.travel_destination.tourist_attractions",
+            direction="forward",
+            parent_evidence_paths={"m.city_c": ()},
+            limit_per_source=2,
+            total_limit=2,
+            rerank_context=CandidateRerankContext(
+                expected_answer_type="museum",
+                expected_next_type="museum",
+                relation_hint_ids=("architecture.museum.established",),
+                subquestion="What museum was established latest?",
+            ),
+            overfetch_factor=3,
+            max_overfetch=10,
+            min_candidates_for_rerank=1,
+        )
+        assert reranked.next_nodes[0] == "m.zz_museum"
+        assert reranked.evidence_paths["m.zz_museum"] == (
+            EvidenceEdge(
+                source_id="m.city_c",
+                relation="travel.travel_destination.tourist_attractions",
+                direction="forward",
+                target_id="m.zz_museum",
+            ),
+        )
+    finally:
+        backend.close()
+
+
+def test_expand_frontier_empty_rerank_context_preserves_order(tmp_path: Path) -> None:
+    db_path, index_dir = _build_relation_beam_fixture(tmp_path)
+    backend = IndexedSQLiteGraphBackend(db_path=db_path, index_dir=index_dir, neighbor_limit=20)
+    try:
+        expansion = backend.expand_frontier_by_relation(
+            ["m.city_c"],
+            relation="travel.travel_destination.tourist_attractions",
+            direction="forward",
+            parent_evidence_paths={"m.city_c": ()},
+            limit_per_source=2,
+            total_limit=2,
+            rerank_context=CandidateRerankContext(),
+            overfetch_factor=3,
+            max_overfetch=10,
+            min_candidates_for_rerank=1,
+        )
+        assert expansion.next_nodes == ("m.attraction_0", "m.attraction_1")
+    finally:
+        backend.close()
+
+
+def test_rank_entities_by_numeric_attribute_orders_in_sqlite(tmp_path: Path) -> None:
+    db_path, index_dir = _build_relation_beam_fixture(tmp_path)
+    backend = IndexedSQLiteGraphBackend(db_path=db_path, index_dir=index_dir, neighbor_limit=20)
+    try:
+        argmax_rows = backend.rank_entities_by_numeric_attribute(
+            source_ids=["m.attraction_0", "m.zz_museum"],
+            relation_ids=["architecture.museum.established"],
+            operation="argmax",
+            limit=2,
+        )
+        assert [row["source_entity_id"] for row in argmax_rows] == ["m.zz_museum", "m.attraction_0"]
+        assert [row["numeric_value"] for row in argmax_rows] == [1900.0, 1800.0]
+
+        argmin_rows = backend.rank_entities_by_numeric_attribute(
+            source_ids=["m.attraction_0", "m.zz_museum"],
+            relation_ids=["architecture.museum.established"],
+            operation="argmin",
+            limit=2,
+        )
+        assert [row["source_entity_id"] for row in argmin_rows] == ["m.attraction_0", "m.zz_museum"]
     finally:
         backend.close()
 
@@ -567,7 +715,8 @@ def test_subquestion_relation_explorer_emits_cvt_bundle_path(tmp_path: Path) -> 
         assert "people.person.spouse_s" in relations
         assert "people.marriage.spouse" in relations
         assert bundle.terminal_node_id == "m.person_b"
-        assert "m.marriage {" in bundle.text
+        assert "[CVT:" in bundle.text
+        assert "{spouse:" in bundle.text
         assert "spouse: [Person A, Person B]" in bundle.text
     finally:
         backend.close()

@@ -58,22 +58,41 @@ def _question_implies_operation(question: str) -> str:
     normalized = normalize_text(question)
     tokens = re.findall(r"[a-z0-9]+", normalized)
     token_set = set(tokens)
-    if "how many" in normalized or "number of" in normalized or "count" in token_set:
-        return "count"
+    if any(marker in token_set for marker in ("most", "largest", "highest", "biggest", "longest", "latest")):
+        return "argmax"
+    if any(marker in token_set for marker in ("least", "smallest", "lowest", "earliest", "shortest")):
+        return "argmin"
     if (
         "among these" in normalized
         or "intersection" in token_set
         or "overlap" in token_set
         or "same" in token_set
+        or "shared" in token_set
         or "both" in token_set
         or "also" in token_set
     ):
         return "intersect"
-    if any(marker in token_set for marker in ("most", "largest", "highest", "biggest", "longest", "latest")):
-        return "argmax"
-    if any(marker in token_set for marker in ("least", "smallest", "lowest", "earliest", "shortest")):
-        return "argmin"
+    if "how many" in normalized or "number of" in normalized or "count" in token_set:
+        return "count"
     return "none"
+
+
+def _parse_numeric_or_year(value: str) -> float | None:
+    """Parse a numeric aggregate value, accepting date-like strings by year."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        pass
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
+    if match is None:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -84,10 +103,10 @@ class SubquestionExecutionContext:
     sub_question: SubQuestionSpec
     graph_api: Any
     step_seed_ids: list[str]
-    constraint_target_ids: list[str]
     relation_ids: list[str]
     resolved_sub_answers: dict[str, dict[str, Any]]
     execute_explore: Callable[[], list[ReasoningPath]]
+    constraint_target_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -856,15 +875,21 @@ class AggregateSolver(BaseSubquestionSolver):
     ) -> tuple[list[str], str, str, str]:
         graph_api = context.graph_api
         relation_ids = self._resolve_relation_ids_from_hints(context)
-        if relation_ids:
-            value_mode = "numeric_attribute" if operation in {"argmax", "argmin"} else "entity"
-            return relation_ids[: self._aggregate_relation_top_k()], "forward", value_mode, "hint_only"
         if graph_api is not None and hasattr(graph_api, "expand_relation_candidates_for_aggregate"):
             candidates = graph_api.expand_relation_candidates_for_aggregate(
                 seed_ids=seed_ids,
                 expected_answer_type=context.sub_question.expected_answer_type,
                 include_literals=True,
             )
+            if relation_ids:
+                relation_id_set = set(relation_ids)
+                relation_candidates = [
+                    candidate for candidate in candidates
+                    if str(candidate.get("relation_id") or "").strip() in relation_id_set
+                ]
+                if relation_candidates:
+                    candidates = relation_candidates
+            candidates = self._rank_aggregate_relation_candidates(context, candidates, operation)
             if candidates:
                 selected = [str(item.get("relation_id") or "").strip() for item in candidates[: self._aggregate_relation_top_k()]]
                 selected = [item for item in selected if item]
@@ -883,8 +908,83 @@ class AggregateSolver(BaseSubquestionSolver):
                         token in relation_text for token in ("date", "time", "number", "rate", "population", "area", "gdp")
                     ):
                         value_mode = "numeric_attribute"
-                    return selected, direction, value_mode, "backend_candidates"
+                    planning_mode = "hint_candidates" if relation_ids else "backend_candidates"
+                    return selected, direction, value_mode, planning_mode
+        if relation_ids:
+            value_mode = "numeric_attribute" if operation in {"argmax", "argmin"} else "entity"
+            return relation_ids[: self._aggregate_relation_top_k()], "forward", value_mode, "hint_only"
         return [], "forward", "entity", "none"
+
+    def _aggregate_relation_alias_score(self, query_tokens: set[str], relation_text: str) -> float:
+        score = 0.0
+        alias_groups = [
+            ({"establishment", "established", "founded", "foundation", "founding"}, ("establish", "founded", "foundation", "founding")),
+            ({"population", "populations"}, ("population",)),
+            ({"postgraduates", "postgraduate", "graduate", "graduates"}, ("postgraduate", "graduate", "enrollment", "student")),
+            ({"undergraduates", "undergraduate", "undergrad", "undergrads"}, ("undergraduate", "undergrad", "enrollment", "student")),
+            ({"enrollment", "students", "student"}, ("enrollment", "student")),
+            ({"calling", "code", "phone"}, ("calling code", "phone", "telephone", "dialing")),
+            ({"won", "win", "championship", "series"}, ("championship", "winner", "won", "wins", "world series")),
+            ({"date", "year", "recent", "latest", "earliest", "current"}, ("date", "year", "time", "start", "end")),
+        ]
+        for query_aliases, relation_aliases in alias_groups:
+            if query_tokens & query_aliases and any(alias in relation_text for alias in relation_aliases):
+                score += 10.0
+        return score
+
+    def _aggregate_relation_query_text(self, context: SubquestionExecutionContext) -> str:
+        return normalize_text(
+            " ".join(
+                [
+                    context.sub_question.question,
+                    *[hint.name for hint in context.sub_question.interested_relations if hint.name],
+                    *[
+                        alias
+                        for hint in context.sub_question.interested_relations
+                        for alias in hint.aliases
+                        if alias
+                    ],
+                    *[hint.description for hint in context.sub_question.interested_relations if hint.description],
+                ]
+            )
+        )
+
+    def _rank_aggregate_relation_candidates(
+        self,
+        context: SubquestionExecutionContext,
+        candidates: list[dict[str, Any]],
+        operation: str,
+    ) -> list[dict[str, Any]]:
+        if not candidates:
+            return candidates
+        query_text = self._aggregate_relation_query_text(context)
+        query_tokens = {token for token in query_text.split() if token}
+        if not query_tokens and operation not in {"argmax", "argmin"}:
+            return candidates
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for index, candidate in enumerate(candidates):
+            relation_text = normalize_text(
+                " ".join(
+                    [
+                        str(candidate.get("relation_id") or ""),
+                        str(candidate.get("relation_name") or ""),
+                        *[str(item) for item in candidate.get("sample_target_types", [])],
+                        *[str(item) for item in candidate.get("sample_target_names", [])],
+                    ]
+                )
+            )
+            score = min(3.0, float(candidate.get("score", 0.0) or 0.0))
+            if query_text:
+                score += 12.0 * _token_overlap(query_text, relation_text)
+            score += self._aggregate_relation_alias_score(query_tokens, relation_text)
+            if operation in {"argmax", "argmin"}:
+                if any(token in relation_text for token in ("date", "time", "year", "establish", "founded", "population", "area", "number", "rate", "gdp")):
+                    score += 3.0
+                if any(_parse_numeric_or_year(str(item)) is not None for item in candidate.get("sample_target_names", [])):
+                    score += 2.0
+            scored.append((score - index * 0.0001, candidate))
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("relation_id") or "")))
+        return [candidate for _, candidate in scored]
 
     def _filter_entity_rows_by_expected_type(
         self,
@@ -924,6 +1024,61 @@ class AggregateSolver(BaseSubquestionSolver):
             if any(alias and alias in haystack for alias in expected_aliases):
                 filtered.append(row)
         return filtered, len(rows), len(filtered)
+
+    def _attribute_row_to_path(
+        self,
+        row: dict[str, Any],
+        operation: str,
+    ) -> ReasoningPath | None:
+        source_id = str(row.get("source_entity_id") or "").strip()
+        source_label = str(row.get("source_label") or source_id).strip()
+        relation_id = str(row.get("relation_id") or "aggregate.attribute").strip()
+        relation_name = str(row.get("relation_name") or relation_id).strip()
+        value = str(row.get("value") or row.get("score") or row.get("numeric_value") or "").strip()
+        if not source_id and not source_label:
+            return None
+        if not value:
+            return None
+        triple = Triple(head=source_label or source_id, relation=relation_id, tail=value)
+        text = path_to_text([source_label or source_id, value], [triple])
+        return ReasoningPath(
+            triples=[triple],
+            nodes=[source_label or source_id, value],
+            text=text,
+            source_stage="sql_aggregate",
+            triple_facts=[
+                _make_triple_fact(
+                    head_id=source_id,
+                    head_label=source_label or source_id,
+                    relation_id=relation_id,
+                    tail_id="",
+                    tail_label=value,
+                    tail_kind="literal",
+                )
+            ],
+            pruning_status="preserved",
+            matched_relations=[relation_id],
+            path_score=float(row.get("numeric_value") or row.get("score") or 0.0),
+            search_score_breakdown={"aggregate_operation": 1.0 if operation in {"argmax", "argmin"} else 0.0},
+            edge_ids=[f"{source_id}:{relation_id}:{value}"] if source_id and relation_id else [],
+            terminal_node_id=source_id,
+            terminal_node_kind="id" if source_id else "literal",
+            matched_answer_type_hints=[],
+            search_strategy="sql_aggregate",
+        )
+
+    def _attribute_rows_to_paths(
+        self,
+        rows: list[dict[str, Any]],
+        operation: str,
+        limit: int = 12,
+    ) -> list[ReasoningPath]:
+        paths: list[ReasoningPath] = []
+        for row in rows[: max(1, int(limit))]:
+            path = self._attribute_row_to_path(row, operation)
+            if path is not None:
+                paths.append(path)
+        return paths
 
     def _graph_sql_aggregate(
         self,
@@ -1054,9 +1209,10 @@ class AggregateSolver(BaseSubquestionSolver):
                     value_id = str(winner.get("source_entity_id") or "").strip()
                     value_label = str(winner.get("source_label") or winner.get("value") or "").strip()
                     score = float(winner.get("numeric_value") or 0.0)
+                    candidate_paths = self._attribute_rows_to_paths(ranked_rows, operation)
                     return SubquestionSolverResult(
                         solver_type=self.solver_type,
-                        candidate_paths=[],
+                        candidate_paths=candidate_paths,
                         structured_outputs={
                             "entity_set_role": "candidate_answers",
                             "set_operation_hint": operation,
@@ -1182,9 +1338,8 @@ class AggregateSolver(BaseSubquestionSolver):
             parsed_rows: list[tuple[int, str, str, str, float]] = []
             for row_idx, row in enumerate(dependency_rows):
                 value_text = str(row.get("value") or "").strip()
-                try:
-                    score = float(value_text.replace(",", ""))
-                except ValueError:
+                score = _parse_numeric_or_year(value_text)
+                if score is None:
                     continue
                 parsed_rows.append(
                     (
@@ -1291,6 +1446,7 @@ class AggregateSolver(BaseSubquestionSolver):
                 value_id = str(best.get("source_entity_id") or "").strip()
                 value_label = str(best.get("source_label") or best.get("value") or "").strip()
                 score = float(best.get("numeric_value") or 0.0)
+                candidate_paths = self._attribute_rows_to_paths(dependency_rows, operation)
                 LOGGER.info(
                     "Aggregate solver execution sub_question_id=%s operation=%s input_set_count=%d attribute_row_count=%d lookup_linked=false fallback_used=false sql_backed=true",
                     context.sub_question.id,
@@ -1300,7 +1456,7 @@ class AggregateSolver(BaseSubquestionSolver):
                 )
                 return SubquestionSolverResult(
                     solver_type=self.solver_type,
-                    candidate_paths=[],
+                    candidate_paths=candidate_paths,
                     structured_outputs={
                         "entity_set_role": "candidate_answers",
                         "set_operation_hint": operation,
